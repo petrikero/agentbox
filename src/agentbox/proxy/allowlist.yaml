@@ -1,0 +1,159 @@
+# Default agentbox network policy.
+#
+# `permissive: true` means the proxy lets every host and every request
+# through unchanged; only the credential-swap handlers run (the agent's
+# `ghp_AGENTBOX_SURROGATE_*` token is exchanged for the host's real PAT
+# on github.com / api.github.com / `*.github.com`). All the lists
+# below are ignored in permissive mode -- they're kept here as a
+# schema reference for when the policy gets dialled back in.
+#
+# To run with strict scoping, drop `permissive` and pass a custom
+# allowlist with `--allowlist <path>`. The lists below show every
+# field the strict path understands.
+
+permissive: true
+
+# Network allowlist (strict mode only).
+#
+# `domains` entries allow any path/method on the host (fnmatch).
+# `url_prefixes` entries match host + path and optionally method.
+# Both lists are evaluated; first match wins. Hosts are matched
+# case-insensitively. Note `*.example.com` does not match the bare
+# `example.com` -- list both when you want both.
+
+domains:
+  # AI provider APIs
+  - api.anthropic.com
+  - api.openai.com
+  - api.z.ai
+
+  # Claude Code console / OAuth (login + token refresh).
+  # ``api.anthropic.com`` alone is enough for an already-authenticated
+  # session, but the v2.x client also reaches platform.claude.com on
+  # startup and console.anthropic.com during fresh OAuth.
+  - platform.claude.com
+  - console.anthropic.com
+
+  # GitHub: API and web (broad reads + agent operations)
+  - api.github.com
+  - github.com
+  - "*.github.com"
+  - "*.githubusercontent.com"
+
+  # npm / Python package registries
+  - registry.npmjs.org
+  - pypi.org
+  - files.pythonhosted.org
+
+  # Go module ecosystem: meta-import resolution + module proxy + checksum DB
+  # `*.golang.org` covers proxy.golang.org, sum.golang.org, google.golang.org,
+  # etc.; `golang.org` is needed separately for the bare host.
+  - golang.org
+  - "*.golang.org"
+  - go.yaml.in
+  - gopkg.in
+
+# Examples of tighter scoping (override the broad domain entries above):
+#
+# url_prefixes:
+#   # Read-only on a specific repo
+#   - host: api.github.com
+#     path: /repos/your-org/your-repo*
+#     methods: [GET]
+#   # Allow comments on PRs/issues in that repo
+#   - host: api.github.com
+#     path: /repos/your-org/your-repo/issues/*/comments
+#     methods: [POST]
+#   # Allow git push to that repo
+#   - host: github.com
+#     path: /your-org/your-repo.git/git-receive-pack
+#     methods: [POST]
+
+# GraphQL gate for api.github.com/graphql (strict mode only).
+#
+# Two layers run on every POST:
+#   1. graphql_operations (default-deny). Any operation type/field name
+#      not on the allowlist is blocked as "unsupported_feature" and
+#      logged so operators can extend the list as GitHub adds features.
+#   2. repos[]. The launcher passes one or more `--repo OWNER/NAME`
+#      flags; mutations whose targeted repo isn't in this list are
+#      blocked as "out_of_scope". Reads (queries) work against any
+#      repo the host's PAT can already see -- the token itself is the
+#      outer fence; the gate just keeps writes inside the named repos.
+#
+# `repos[].pull_requests`, `issues`, and `branches` are reserved for
+# finer-grained future scoping -- the schema parses them today, but
+# v1 enforces only `full_name`.
+github:
+  graphql_operations:
+    queries:
+      # Curated supported-query allowlist. Anything outside this list
+      # returns "unsupported_feature" + structured log line (so the
+      # operator can decide whether to add it).
+      - viewer
+      - repository
+      - organization
+      - user
+      - node
+      - nodes
+      - search
+      - rateLimit
+      - __schema
+      - __type
+    mutations:
+      # Curated supported-mutation allowlist. Default v1 set covers
+      # the common `gh` PR/issue/review flow.
+      - addComment
+      - addLabelsToLabelable
+      - addPullRequestReview
+      - closeIssue
+      - createCommitOnBranch
+      - createIssue
+      - createPullRequest
+      - mergePullRequest
+      - markPullRequestReadyForReview
+      - removeLabelsFromLabelable
+      - reopenIssue
+      - requestReviews
+      - submitPullRequestReview
+      - updateIssue
+      - updatePullRequest
+    subscriptions: []
+    dangerous:
+      # Shadow-mode watchlist. These operations are *not* blocked --
+      # if Layer 2 (scope) says the request targets an allowed repo,
+      # it goes through. But each match emits a WARN log line so
+      # operators can spot agent behaviour worth tightening (drop
+      # the field from `mutations:` above, narrow `repos:`, or fix
+      # the agent's prompt).
+      #
+      # Patterns are fnmatch-style and match the full
+      # `<type>/<field>` tag (so you can warn on a query if you
+      # want, e.g. `query/__schema` for introspection probing).
+      - mutation/mergePullRequest
+      - mutation/createCommitOnBranch
+      # Add more if you broaden `mutations:` above. Common candidates:
+      # - mutation/deleteRepository
+      # - mutation/transferRepository
+      # - mutation/archiveRepository
+      # - mutation/unarchiveRepository
+      # - mutation/deleteRef               # branch/tag deletion
+      # - mutation/createBranchProtectionRule
+      # - mutation/deleteBranchProtectionRule
+      # - mutation/addEnterpriseAdmin
+# repos:
+#   - full_name: your-org/your-repo
+#     pull_requests: ["*"]    # reserved for v2 (per-PR write scoping)
+#     issues:        ["*"]    # reserved for v2
+#     branches:      ["*"]    # reserved for v3 (git push REST scoping)
+#
+# TODO(policy-language): the per-repo fields above are placeholders
+# for a richer policy language. We want to express things like:
+#   - operations: [addComment, createPullRequest]   # per-repo op subset
+#   - issue_authors: [@me]                          # only act on issues you opened
+#   - pull_request_authors: [@me]
+#   - branches_matching: ["agent/*", "!main"]
+#   - dangerous_overrides: [...]                    # per-repo watchlist
+# The scope check already decodes per-object DB IDs from node IDs,
+# so the enforcement substrate is in place. See matching markers in
+# ``cli.py``, ``proxy/graphql_scope.py``, and ``docs/design.md``.

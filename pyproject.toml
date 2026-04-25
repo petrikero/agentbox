@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentbox"
+version = "0.1.0"
+description = "Sandbox launcher for AI coding agents with credential-isolating proxy"
+license = "MIT"
+requires-python = ">=3.13"
+dependencies = [
+    "graphql-core>=3.2.8",
+    "mitmproxy>=12.2.2",
+    "pyyaml>=6.0.3",
+    "rich>=15.0.0",
+]
+
+[project.scripts]
+agentbox = "agentbox.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentbox"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"src/agentbox/sandbox/Dockerfile" = "agentbox/sandbox/Dockerfile"
+"src/agentbox/sandbox/bashrc" = "agentbox/sandbox/bashrc"
+"src/agentbox/sandbox/proxy/Dockerfile" = "agentbox/sandbox/proxy/Dockerfile"
+"src/agentbox/sandbox/proxy/entrypoint.py" = "agentbox/sandbox/proxy/entrypoint.py"
+"src/agentbox/sandbox/proxy/dns.py" = "agentbox/sandbox/proxy/dns.py"
+"src/agentbox/proxy/allowlist.yaml" = "agentbox/proxy/allowlist.yaml"
+
+[tool.pyright]
+pythonVersion = "3.13"
+typeCheckingMode = "standard"
+include = ["src/", "tests/"]
+extraPaths = ["src"]
+venvPath = "."
+venv = ".venv"
+
+[tool.ruff]
+target-version = "py313"
+include = ["src/**/*.py", "tests/**/*.py"]
+
+[tool.ruff.lint]
+# Safety and correctness only  -- no style opinions
+select = [
+    "F",     # pyflakes (unused imports, undefined names, etc.)
+    "E7",    # syntax errors
+    "E9",    # runtime errors
+    "W6",    # deprecated features
+    "B",     # bugbear (likely bugs, design problems)
+    "SIM",   # simplify (unnecessary complexity that hides bugs)
+    "UP",    # pyupgrade (use modern Python features)
+    "RUF",   # ruff-specific rules (ambiguous characters, etc.)
+    "PLE",   # pylint errors
+    "PLW",   # pylint warnings
+    "T20",   # print statements (flag accidental debug prints  -- we use logging)
+]
+ignore = [
+    "T201",  # allow print()  -- we use it intentionally for user-facing output
+    "UP007", # allow X | Y union syntax (already used throughout)
+]
+
+[dependency-groups]
+dev = [
+    "pyright>=1.1.409",
+    "ruff>=0.15.12",
+]

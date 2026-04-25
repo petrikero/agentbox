@@ -1,0 +1,79 @@
+"""Entry point: ``python -m agentbox.proxy``.
+
+Wraps mitmdump with the agentbox filter addon. Exists so the launcher can
+spawn a self-contained subprocess without callers needing to know mitmproxy
+CLI conventions.
+
+Two modes:
+
+- **regular** (default): explicit-proxy CONNECT mode, listens on
+  ``--listen-host:--port``. The launcher uses this for
+  ``network: permissive`` -- the container reaches it via
+  ``HTTPS_PROXY=http://host.docker.internal:<port>``.
+- **transparent**: mitmproxy's transparent mode, single combined
+  port. The sidecar entrypoint uses this for
+  ``network: transparent-shared`` -- the container's traffic is
+  redirected here by iptables NAT rules in the shared netns, and
+  mitmproxy reads the original destination via ``SO_ORIGINAL_DST``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+from mitmproxy.tools.main import mitmdump
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog="agentbox.proxy")
+    parser.add_argument("--port", type=int, required=True)
+    parser.add_argument("--credentials", required=True)
+    parser.add_argument("--allowlist", required=True)
+    parser.add_argument(
+        "--repos", required=True,
+        help="Path to JSON list of {full_name, node_id} for GitHub repos "
+             "the agent is permitted to write to via /graphql.",
+    )
+    parser.add_argument("--listen-host", default="127.0.0.1")
+    parser.add_argument(
+        "--transparent", action="store_true",
+        help="Run mitmdump in transparent mode (used by the sidecar "
+             "deployment). Skips --listen-host (mitmproxy binds 0.0.0.0 "
+             "in transparent mode) and uses --mode transparent so the "
+             "original destination is recovered via SO_ORIGINAL_DST.",
+    )
+    args = parser.parse_args()
+
+    filter_path = Path(__file__).parent / "filter.py"
+
+    if args.transparent:
+        sys.argv = [
+            "mitmdump",
+            "--mode", "transparent",
+            "--listen-port", str(args.port),
+            # --showhost makes mitmproxy log the SNI/Host-derived target
+            # rather than the raw IP it sees on the redirected socket --
+            # easier to read in the sidecar logs.
+            "--showhost",
+            "-s", str(filter_path),
+            "--set", f"agentbox_credentials={args.credentials}",
+            "--set", f"agentbox_allowlist={args.allowlist}",
+            "--set", f"agentbox_repos={args.repos}",
+        ]
+    else:
+        sys.argv = [
+            "mitmdump",
+            "--listen-host", args.listen_host,
+            "--listen-port", str(args.port),
+            "-s", str(filter_path),
+            "--set", f"agentbox_credentials={args.credentials}",
+            "--set", f"agentbox_allowlist={args.allowlist}",
+            "--set", f"agentbox_repos={args.repos}",
+        ]
+    mitmdump()
+
+
+if __name__ == "__main__":
+    main()
