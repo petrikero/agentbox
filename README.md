@@ -1,5 +1,7 @@
 # agentbox
 
+> ⚠️ **Experimental:** This project is experimental and under active development. Use with caution. The security model has not been independently audited, interfaces may change without notice, and the limitations listed below (notably permissive networking and unisolated agent credentials) mean you should not rely on it for protection against untrusted code or prompts in production settings.
+
 Run AI coding agents like [pi](https://www.npmjs.com/package/@mariozechner/pi-coding-agent) and [Claude Code](https://www.npmjs.com/package/@anthropic-ai/claude-code) in a Docker sandbox while keeping your host GitHub token out of the agent container.
 
 The security model draws from the [Airut project](https://github.com/airutorg/airut).
