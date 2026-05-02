@@ -208,7 +208,7 @@ host
 │      - GH_TOKEN=<surrogate>
 │      - mitmproxy CA bind-mounted at /usr/local/share/ca-certificates/agentbox-ca.crt
 │      - per-tool CA env vars (NODE_EXTRA_CA_CERTS, GIT_SSL_CAINFO, ...)
-│      - cwd mounted at /work
+│      - cwd mirrored under /agentbox/ (e.g. C:\code\agentbox -> /agentbox/c/code/agentbox)
 │      - ~/.pi mounted at /home/agentbox/.pi
 │      - ~/.claude mounted at /home/agentbox/.claude (if it exists on the host)
 └── ~/.pi, ~/.claude (host)           # agent state + credentials, mounted into container
@@ -248,8 +248,8 @@ agentbox/
 
 When `agentbox pi -p "<prompt>"` runs (and the user hasn't passed `--no-session`), the launcher spawns a watcher thread that:
 
-1. Snapshots existing files in `~/.pi/agent/sessions/--work--/` before launch.
-2. Polls the directory for the new `.jsonl` pi creates (always written, since pi defaults to session persistence; pi's session encoding for cwd `/work` is `--work--`).
+1. Snapshots existing files in the pi session dir for the current cwd before launch (pi names it by replacing `/` with `--` in its cwd, e.g. `/agentbox/c/code/agentbox` -> `~/.pi/agent/sessions/--agentbox--c--code--agentbox/`).
+2. Polls the directory for the new `.jsonl` pi creates (always written, since pi defaults to session persistence).
 3. Tails the file from the host as pi appends to it, parsing each event and printing a single-line summary on stderr (model change, thinking summary, tool calls with arguments, tool results).
 4. Pi runs in plain `--mode text`, so the final assistant answer flows to stdout untouched — `agentbox pi -p ... | pbcopy` still copies just the answer.
 

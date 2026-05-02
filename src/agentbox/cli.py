@@ -988,6 +988,35 @@ def _write_claude_managed_settings(path: Path) -> None:
     )
 
 
+_CONTAINER_MOUNT_ROOT = "/agentbox"
+
+
+def _host_to_container_path(host_path: Path) -> str:
+    """Mirror a host filesystem path under ``/agentbox`` inside the container.
+
+    Each project gets its own container path so per-cwd state (pi
+    session dirs, Claude project entries, ...) doesn't collide across
+    projects when launched through agentbox.
+
+    Examples:
+        ``C:\\code\\agentbox`` -> ``/agentbox/c/code/agentbox``
+        ``/home/user/proj``    -> ``/agentbox/home/user/proj``
+
+    The drive letter is lowercased; the rest of the path keeps its
+    original case so Linux-side tools see the same names the host did.
+    """
+    posix = host_path.as_posix()
+    if len(posix) >= 2 and posix[1] == ":":
+        drive = posix[0].lower()
+        rest = posix[2:].lstrip("/")
+        suffix = f"{drive}/{rest}" if rest else drive
+    else:
+        suffix = posix.lstrip("/")
+    if not suffix:
+        return _CONTAINER_MOUNT_ROOT
+    return f"{_CONTAINER_MOUNT_ROOT}/{suffix}"
+
+
 def _run_agent(
     mode: str,
     port: int,
@@ -1003,6 +1032,7 @@ def _run_agent(
 ) -> int:
     cfg = MODES[mode]
     cwd = Path.cwd().resolve()
+    container_cwd = _host_to_container_path(cwd)
     home = Path.home()
     pi_dir = home / ".pi"
     pi_dir.mkdir(exist_ok=True)
@@ -1012,9 +1042,9 @@ def _run_agent(
     progress = _progress_mode_for(mode, mode_args)
     # Snapshot existing session files so the pi watcher can pick out
     # the new one pi creates. Only relevant for ``progress == "pi"``.
-    # The container always runs with cwd ``/work``, so pi encodes its
-    # session subdir as ``--work--`` regardless of the host cwd.
-    session_dir = pi_dir / "agent" / "sessions" / "--work--"
+    # pi names the session subdir from its cwd by replacing ``/`` with
+    # ``--``, so e.g. ``/agentbox/c/code/agentbox`` -> ``--agentbox--c--code--agentbox``.
+    session_dir = pi_dir / "agent" / "sessions" / container_cwd.replace("/", "--")
     session_snapshot: set[str] = set()
     if progress == "pi":
         session_dir.mkdir(parents=True, exist_ok=True)
@@ -1052,8 +1082,8 @@ def _run_agent(
         cmd.append("-it")
 
     cmd += [
-        "-v", f"{cwd.as_posix()}:/work",
-        "-w", "/work",
+        "-v", f"{cwd.as_posix()}:{container_cwd}",
+        "-w", container_cwd,
         "-v", f"{pi_dir.as_posix()}:/home/agentbox/.pi",
         "-v", f"{Path(ca_path).as_posix()}:{container_ca}:ro",
         "-e", f"NODE_EXTRA_CA_CERTS={container_ca}",
@@ -1123,7 +1153,7 @@ def _run_agent(
         cmd.extend(["--output-format", "stream-json", "--verbose"])
 
     mounts = [
-        f"{_short(cwd)} → /work",
+        f"{_short(cwd)} → {container_cwd}",
         "~/.pi",
         "~/.claude" if claude_dir.exists() else None,
         "~/.claude.json" if claude_json.exists() else None,

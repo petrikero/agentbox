@@ -62,7 +62,7 @@ DEFAULT_NETWORK_MODE = "permissive"
 
 
 # Windows + Git Bash (MSYS) rewrites Unix-style path arguments to native
-# binaries: ``-v /work:/work`` becomes ``-v C:/Program Files/Git/work:...``,
+# binaries: ``-v /agentbox:/agentbox`` becomes ``-v C:/Program Files/Git/agentbox:...``,
 # breaking every docker mount spec. ``MSYS_NO_PATHCONV=1`` disables that
 # rewrite for the docker subprocess we're about to spawn. No-op on
 # macOS/Linux. Pass as ``env=_DOCKER_ENV`` on every docker call.

@@ -13,7 +13,7 @@ For each agent run, the launcher:
 3. Mints a per-session surrogate token and writes proxy state into a temporary directory.
 4. Copies the resolved allowlist into the same temporary directory.
 5. Ensures the mitmproxy CA exists, then starts the proxy on a loopback port.
-6. Starts `docker run` with the current directory mounted at `/work`, `GH_TOKEN` set to the surrogate, proxy env vars configured, and the mitmproxy CA exposed to common toolchains.
+6. Starts `docker run` with the current directory mirrored under `/agentbox/` (e.g. `C:\code\agentbox` -> `/agentbox/c/code/agentbox`), `GH_TOKEN` set to the surrogate, proxy env vars configured, and the mitmproxy CA exposed to common toolchains.
 7. Stops the proxy and removes temporary files on exit.
 
 ## Runtime Pieces
@@ -22,7 +22,7 @@ The base image contains the agent runtime: `bash`, `git`, `gh`, `pi`, `claude`, 
 
 Every invocation rebuilds the base image and, when present, the project image. Docker layer cache makes no-op rebuilds cheap; `--no-cache` bypasses that cache for both tiers.
 
-The container runs as the `agentbox` user with dropped Linux capabilities and `no-new-privileges`. The host working tree is mounted at `/work`. Agent state is mounted from the host when present:
+The container runs as the `agentbox` user with dropped Linux capabilities and `no-new-privileges`. The host working tree is mounted at the mirrored path under `/agentbox/` (so per-project state in tools like Claude Code stays separated by host cwd). Agent state is mounted from the host when present:
 
 - `~/.pi` -> `/home/agentbox/.pi`
 - `~/.claude` -> `/home/agentbox/.claude`

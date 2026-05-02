@@ -8,7 +8,8 @@
 #   - `pi` and `claude` on PATH
 #   - `git-credential-agentbox` on PATH; system gitconfig already wires it up
 #     for github.com / gist.github.com so `git push` over HTTPS works
-#   - WORKDIR /work; image contains a non-root `agentbox` user (uid 1000)
+#   - WORKDIR /agentbox (launcher overrides per-project at run time);
+#     image contains a non-root `agentbox` user (uid 1000)
 #     and the launcher runs the container as `agentbox` via `docker run --user`.
 #     Build-time stays root so project Dockerfile.agentbox files can install
 #     packages without ceremony.
@@ -75,8 +76,8 @@ RUN printf '#!/bin/sh\n[ "$1" = get ] || exit 0\nprintf "username=x-access-token
 RUN groupadd --gid 1000 agentbox \
  && useradd  --uid 1000 --gid 1000 --create-home --shell /bin/bash agentbox \
  && install -d -o agentbox -g agentbox \
-      /home/agentbox/.pi /home/agentbox/.claude /work
+      /home/agentbox/.pi /home/agentbox/.claude /agentbox
 
 COPY --chown=agentbox:agentbox bashrc /home/agentbox/.bashrc
 
-WORKDIR /work
+WORKDIR /agentbox
