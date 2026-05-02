@@ -693,7 +693,16 @@ class GithubWriteGateTests(unittest.TestCase):
         self._patch.stop()
 
     def _scoped_filter(self) -> AgentboxFilter:
-        f = _make_filter(domains=["api.github.com", "github.com"])
+        # Network allowlist permits all the github write surfaces so
+        # the request reaches our gate; the gate itself is what the
+        # tests assert on. Production runs typically use a permissive
+        # allowlist, which has the same effect here.
+        f = _make_filter(domains=[
+            "api.github.com",
+            "uploads.github.com",
+            "github.com",
+            "gist.github.com",
+        ])
         f.github_mode = "scoped"
         f.allowed_repo_full_names = frozenset({"my-org/allowed"})
         return f
@@ -862,6 +871,166 @@ class GithubWriteGateTests(unittest.TestCase):
             "POST",
             "https://api.github.com/repos/anyone/anything/issues",
             body=b'{}',
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    # uploads.github.com (release-asset uploads) ------------------------
+
+    def test_uploads_post_to_listed_repo_passes(self) -> None:
+        # Release-asset uploads go to uploads.github.com but follow
+        # the same /repos/{o}/{n}/... path shape as the API; the
+        # fence has to apply to both hosts.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST",
+            "https://uploads.github.com/repos/my-org/allowed/"
+            "releases/123/assets?name=note.txt",
+            body=b"binary asset bytes",
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    def test_uploads_post_to_unlisted_repo_blocked(self) -> None:
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST",
+            "https://uploads.github.com/repos/other/exfil/"
+            "releases/1/assets?name=secret.txt",
+            body=b"secret data",
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+        payload = json.loads(flow.response.content)
+        self.assertEqual(payload["error"], "scope_out_of_scope")
+        self.assertEqual(payload["detail"], "other/exfil")
+
+    # Gist writes -------------------------------------------------------
+
+    def test_gist_create_blocked(self) -> None:
+        # POST /gists is the cleanest exfil channel imaginable;
+        # categorically denied in scoped mode regardless of repos.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST", "https://api.github.com/gists",
+            body=b'{"public":true,"files":{"x":{"content":"<secret>"}}}',
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+        payload = json.loads(flow.response.content)
+        self.assertEqual(payload["error"], "scope_gist_write")
+
+    def test_gist_update_blocked(self) -> None:
+        f = self._scoped_filter()
+        flow = self._flow(
+            "PATCH", "https://api.github.com/gists/abc123",
+            body=b'{"files":{"x":{"content":"y"}}}',
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+
+    def test_gist_delete_blocked(self) -> None:
+        f = self._scoped_filter()
+        flow = self._flow(
+            "DELETE", "https://api.github.com/gists/abc123",
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+
+    def test_gist_read_passes(self) -> None:
+        # Reads of gists are fine -- only writes are fenced.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "GET", "https://api.github.com/gists/abc123",
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    def test_gist_git_push_blocked(self) -> None:
+        # gist.github.com hosts git push to gists. Categorically
+        # denied since gists don't fit the per-repo scope model.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST",
+            "https://gist.github.com/abc123.git/git-receive-pack",
+            body=b"\x00\x00pack data",
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+
+    def test_gist_git_fetch_passes(self) -> None:
+        # Reads (upload-pack) are not fenced even on gist.github.com.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "GET",
+            "https://gist.github.com/abc123.git/info/refs"
+            "?service=git-upload-pack",
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    # New-repo creation -------------------------------------------------
+
+    def test_new_user_repo_creation_blocked(self) -> None:
+        # POST /user/repos creates a fresh repo for the authenticated
+        # user. Scoped mode must deny -- the agent would push secrets
+        # to the new repo, sidestepping the per-repo fence.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST", "https://api.github.com/user/repos",
+            body=b'{"name":"exfil","private":false}',
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+        payload = json.loads(flow.response.content)
+        self.assertEqual(payload["error"], "scope_new_repo_creation")
+
+    def test_new_org_repo_creation_blocked(self) -> None:
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST", "https://api.github.com/orgs/some-org/repos",
+            body=b'{"name":"exfil"}',
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+        payload = json.loads(flow.response.content)
+        self.assertEqual(payload["error"], "scope_new_repo_creation")
+
+    def test_user_repos_get_passes(self) -> None:
+        # Listing one's own repos is a read.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "GET", "https://api.github.com/user/repos",
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    # Bypass in non-scoped mode -----------------------------------------
+
+    def test_unrestricted_mode_allows_gist_write(self) -> None:
+        f = self._scoped_filter()
+        f.github_mode = "unrestricted"
+        flow = self._flow(
+            "POST", "https://api.github.com/gists",
+            body=b'{"public":true}',
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    def test_unrestricted_mode_allows_uploads(self) -> None:
+        f = self._scoped_filter()
+        f.github_mode = "unrestricted"
+        flow = self._flow(
+            "POST",
+            "https://uploads.github.com/repos/anyone/anything/"
+            "releases/1/assets",
+            body=b"x",
         )
         f.request(flow)
         resp = getattr(flow, "response", None)

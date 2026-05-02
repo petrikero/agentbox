@@ -80,15 +80,22 @@ from agentbox.proxy.mock_llm import MockLLM
 
 _GRAPHQL_HOST = "api.github.com"
 _GRAPHQL_PATH = "/graphql"
+_UPLOADS_HOST = "uploads.github.com"
+_GIT_HOST = "github.com"
+_GIST_HOST = "gist.github.com"
 
 # REST writes against the repo subtree:
 # /repos/{owner}/{name}            -- repo settings
 # /repos/{owner}/{name}/issues     -- create / list issues
 # /repos/{owner}/{name}/pulls/.../comments
-# ...and many more. Any non-GET method against the subtree is a
+# ...and many more. Any non-read method against the subtree is a
 # write candidate that the scope check needs to consider. We use a
 # simple regex on the path because the repo segment is always at a
 # fixed depth.
+#
+# Same path shape applies on uploads.github.com (release-asset uploads):
+# /repos/{owner}/{name}/releases/{id}/assets?name=...
+# So one regex covers both hosts.
 _REST_REPO_PATH_RE = re.compile(r"^/repos/([^/]+)/([^/]+)(?:/.*)?$")
 
 # git smart-HTTP push:
@@ -100,45 +107,95 @@ _GIT_PUSH_PATH_RE = re.compile(
     r"^/([^/]+)/([^/]+?)(?:\.git)?/git-receive-pack/?$"
 )
 
+# New-repo creation: POST /user/repos (own account) or
+# POST /orgs/{org}/repos (in an org). Either lets the agent spin up
+# a fresh repo it then pushes secrets to -- complete bypass of the
+# per-repo fence. Categorically denied in scoped mode regardless of
+# the allowed-repo set.
+_ORG_REPOS_PATH_RE = re.compile(r"^/orgs/([^/]+)/repos/?$")
+
+# Hosts that hit the REST repo subtree. Both sit behind the same
+# credential-swap handler scope (``*.github.com``), so the surrogate
+# is rewritten to the real PAT on either; the fence has to apply
+# to both or the swap works while the gate doesn't.
+_REST_HOSTS: frozenset[str] = frozenset({_GRAPHQL_HOST, _UPLOADS_HOST})
 
 _READ_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
 
 
-def _repo_from_rest_path(
+def _classify_github_write(
     host: str, method: str, path: str,
-) -> str | None:
-    """Return ``owner/name`` if this is a REST write to the repo subtree.
+) -> tuple[str, str, str] | None:
+    """Classify a request for the GitHub writes-only fence.
 
-    Returns ``None`` if the host isn't api.github.com, the method is
-    a read (``GET``, ``HEAD``, or preflight ``OPTIONS``), or the
-    path isn't under ``/repos/{owner}/{name}/``.
+    Returns one of:
+
+    - ``("repo_scoped", "owner/name", reason)`` -- write tied to a
+      specific repo; pass iff ``owner/name`` is in the launcher's
+      allowed-repo set. ``reason`` tags the surface for log
+      lines (``rest``/``uploads``/``git_push``).
+    - ``("denied", target, reason)`` -- categorically denied in
+      scoped mode regardless of allowed_repos. Gist writes
+      (`reason="gist_write"`) and new-repo creation
+      (`reason="new_repo_creation"`) fall here -- neither maps
+      onto the per-repo scope model, and both are clean
+      exfiltration channels.
+    - ``None`` -- not a write surface; pass through unchecked
+      (host outside the gate's surface, read method, or path
+      that isn't a GitHub write endpoint we recognise).
+
+    Reads (GET / HEAD / OPTIONS) always return ``None`` -- the
+    host PAT is the outer fence on what the proxy forwards, and
+    the public-repo exfil vector is specifically about *writes*.
     """
-    if host != _GRAPHQL_HOST:
-        return None
     if method in _READ_METHODS:
         return None
-    m = _REST_REPO_PATH_RE.match(path)
-    if not m:
-        return None
-    return f"{m.group(1)}/{m.group(2)}"
 
+    if host == _GRAPHQL_HOST:
+        # New-repo creation -- own account.
+        if method == "POST" and path == "/user/repos":
+            return ("denied", "/user/repos", "new_repo_creation")
+        # New-repo creation -- in an org.
+        if method == "POST" and _ORG_REPOS_PATH_RE.match(path):
+            return ("denied", path, "new_repo_creation")
+        # Gist writes via the API. Gists aren't per-repo; no scope
+        # check would meaningfully fence them, and a public gist
+        # is the cleanest exfil channel imaginable.
+        if path == "/gists" or path.startswith("/gists/"):
+            return ("denied", path, "gist_write")
+        m = _REST_REPO_PATH_RE.match(path)
+        if m:
+            return (
+                "repo_scoped", f"{m.group(1)}/{m.group(2)}", "rest",
+            )
+        return None
 
-def _repo_from_git_push_path(
-    host: str, method: str, path: str,
-) -> str | None:
-    """Return ``owner/name`` if this is a smart-HTTP push to GitHub.
+    if host == _UPLOADS_HOST:
+        # Release-asset uploads use the same /repos/{o}/{n}/...
+        # path shape as api.github.com but on a different host.
+        # The credential-swap handler covers ``*.github.com``, so
+        # the surrogate is rewritten here; the fence has to match.
+        m = _REST_REPO_PATH_RE.match(path)
+        if m:
+            return (
+                "repo_scoped", f"{m.group(1)}/{m.group(2)}", "uploads",
+            )
+        return None
 
-    Returns ``None`` for the fetch counterpart (``git-upload-pack``),
-    for non-github.com hosts, or for non-POST methods.
-    """
-    if host != "github.com":
+    if host == _GIT_HOST:
+        m = _GIT_PUSH_PATH_RE.match(path)
+        if m:
+            return (
+                "repo_scoped", f"{m.group(1)}/{m.group(2)}", "git_push",
+            )
         return None
-    if method != "POST":
-        return None
-    m = _GIT_PUSH_PATH_RE.match(path)
-    if not m:
-        return None
-    return f"{m.group(1)}/{m.group(2)}"
+
+    if host == _GIST_HOST:
+        # gist.github.com serves git push to gists. Same exfil
+        # logic as the API gist writes -- categorically denied.
+        return ("denied", path, "gist_write")
+
+    return None
 
 
 _BUNDLED_GITHUB_POLICY = Path(__file__).parent / "github_policy.yaml"
@@ -445,18 +502,24 @@ class AgentboxFilter:
     # ------------------------------------------------------------------
 
     def _apply_github_write_gate(self, flow: http.HTTPFlow) -> bool:
-        """Block writes to repos outside the scoped allow-set.
+        """Block writes outside the scoped policy.
 
-        Two surfaces, same fence:
+        Five surfaces share this fence:
 
-        - **REST**: ``api.github.com/repos/{owner}/{name}/...`` with
-          any non-GET method. The host's PAT can address every repo
-          it has access to via REST; the scope check confines
-          writes to the listed repos. (GraphQL writes are caught by
-          the dedicated /graphql gate above.)
-        - **git smart-HTTP push**: ``github.com/{owner}/{name}.git/
-          git-receive-pack``. ``git-upload-pack`` (fetch) is always
-          allowed -- reads aren't fenced.
+        - **REST repo subtree**: ``api.github.com/repos/{o}/{n}/...``
+          and ``uploads.github.com/repos/{o}/{n}/...`` (release-asset
+          uploads) with any non-read method. Pass iff ``o/n`` is in
+          the listed set.
+        - **git smart-HTTP push**: ``github.com/{o}/{n}.git/
+          git-receive-pack``. Pass iff ``o/n`` is in the listed set.
+          Fetch (``git-upload-pack``) is always allowed.
+        - **Gist writes** (``api.github.com/gists*`` and any non-
+          read on ``gist.github.com``): categorically denied; gists
+          aren't per-repo and a public gist is a clean exfil channel.
+        - **New-repo creation** (``POST /user/repos``,
+          ``POST /orgs/{org}/repos`` on ``api.github.com``):
+          categorically denied; lets the agent spin up a fresh
+          target repo it then pushes secrets to.
 
         Bypassed in ``unrestricted`` and ``public`` modes (the user
         opted out of fencing or has no token to write with anyway).
@@ -470,40 +533,64 @@ class AgentboxFilter:
         path = request.path.split("?", 1)[0]
         method = request.method.upper()
 
-        owner_name = _repo_from_rest_path(host, method, path)
-        if owner_name is None:
-            owner_name = _repo_from_git_push_path(host, method, path)
-        if owner_name is None:
+        verdict = _classify_github_write(host, method, path)
+        if verdict is None:
             return False
 
-        if owner_name in self.allowed_repo_full_names:
+        kind, target, reason = verdict
+
+        if kind == "repo_scoped" and target in self.allowed_repo_full_names:
             return False
 
+        scope_label = (
+            "out_of_scope" if kind == "repo_scoped" else reason
+        )
         ctx.log.warn(
             "agentbox github write: " + json.dumps({
                 "event": "github_write",
                 "verdict": "blocked",
-                "scope": "out_of_scope",
+                "scope": scope_label,
+                "surface": reason,
                 "method": method,
                 "host": host,
                 "path": path,
-                "target": owner_name,
+                "target": target,
             })
         )
+        message = self._write_block_message(reason, target)
         body = json.dumps({
-            "error": "scope_out_of_scope",
-            "message": (
-                "agentbox: write to " + owner_name + " denied -- "
-                "not in the scoped repos set. Pass --repo "
-                "OWNER/NAME to the launcher (or add it under "
-                "github.repos: in agentbox.config.yaml) to allow."
-            ),
-            "detail": owner_name,
+            "error": f"scope_{scope_label}",
+            "message": message,
+            "detail": target,
         }).encode("utf-8")
         flow.response = http.Response.make(
             403, body, {"Content-Type": "application/json"},
         )
         return True
+
+    @staticmethod
+    def _write_block_message(reason: str, target: str) -> str:
+        """One-line rationale for the 403 body, by surface."""
+        if reason == "gist_write":
+            return (
+                "agentbox: gist writes are denied in scoped mode -- "
+                "gists are not per-repo, so they don't fit the "
+                "writes-only fence. Pass --github-mode unrestricted "
+                "if you really need to create gists."
+            )
+        if reason == "new_repo_creation":
+            return (
+                "agentbox: creating new repos is denied in scoped "
+                "mode (a fresh repo would bypass the per-repo "
+                "fence). Pass --github-mode unrestricted if you "
+                "really need to create repos."
+            )
+        return (
+            "agentbox: write to " + target + " denied -- not in the "
+            "scoped repos set. Pass --repo OWNER/NAME to the "
+            "launcher (or add it under github.repos: in "
+            "agentbox.config.yaml) to allow."
+        )
 
     # ------------------------------------------------------------------
     # Network allowlist (existing)
