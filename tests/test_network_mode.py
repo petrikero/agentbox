@@ -203,7 +203,7 @@ class StageSidecarFilesTests(unittest.TestCase):
         self.workdir = self.tmp / "workdir"
         self.workdir.mkdir(mode=0o700)
         # Stand in for the launcher-written session files.
-        for fname in ("credentials.json", "allowlist.yaml", "repos.json"):
+        for fname in ("credentials.json", "allowlist.yaml", "github.json"):
             (self.workdir / fname).write_text("{}", encoding="utf-8")
             (self.workdir / fname).chmod(0o600)
         # Stand in for the host's mitmproxy CA dir.
@@ -236,7 +236,7 @@ class StageSidecarFilesTests(unittest.TestCase):
     @unittest.skipIf(sys.platform == "win32", "chmod is a no-op on Windows")
     def test_session_files_become_world_readable(self) -> None:
         cli._stage_sidecar_files(self.workdir, self.ca_path)
-        for fname in ("credentials.json", "allowlist.yaml", "repos.json"):
+        for fname in ("credentials.json", "allowlist.yaml", "github.json"):
             mode = (self.workdir / fname).stat().st_mode & 0o777
             self.assertEqual(mode, 0o644, f"{fname} mode = {oct(mode)}")
 

@@ -197,6 +197,7 @@ host
 ├── agentbox CLI                       # launcher process, user-facing entry point
 │   ├─ generates GH surrogate         # ghp_<random36> per session
 │   ├─ writes credentials.json        # per-kind: github -> {surrogate, real}
+│   ├─ writes github.json             # {mode, repos: [{full_name, node_id, issues, pull_requests, branches}]}
 │   ├─ writes allowlist.yaml          # per-session policy (copy of source)
 │   ├─ ensures ~/.mitmproxy CA exists
 │   ├─ spawns subprocess:
@@ -241,7 +242,8 @@ agentbox/
         ├── __main__.py             # `python -m agentbox.proxy` -> mitmdump
         ├── filter.py               # mitmproxy addon: allowlist + handler dispatch
         ├── handlers.py             # GithubCredentialHandler (+ future providers)
-        └── allowlist.yaml          # default network policy
+        ├── allowlist.yaml          # default network policy
+        └── github_policy.yaml      # GraphQL operation allowlist + per-repo scope schema
 ```
 
 ### Inline progress for `pi -p`
@@ -330,7 +332,7 @@ Permissive mode builds only `agentbox-base` (and the project image if a `Dockerf
 
 ### Per-session policy
 
-The default allowlist (`agentbox/src/agentbox/proxy/allowlist.yaml`) is permissive — Anthropic, GitHub, npm, PyPI as `domains:` entries. Override per session:
+The default network allowlist (`agentbox/src/agentbox/proxy/allowlist.yaml`) is permissive — Anthropic, GitHub, npm, PyPI as `domains:` entries. Override per session:
 
 ```
 agentbox --allowlist /path/to/custom.yaml
@@ -349,6 +351,23 @@ url_prefixes:
     path: /repos/your-org/your-repo/issues/*/comments
     methods: [POST]
 ```
+
+GitHub-specific access policy is decoupled from the network allowlist and lives in a top-level `github:` block in `agentbox.config.yaml`:
+
+```yaml
+github:
+  mode: auto    # none | unrestricted | scoped | auto (default)
+  repos:
+    - owner/short-form                  # full-access shorthand
+    - name: owner/explicit-form         # per-op allowlist
+      issues:        [comment, create]
+      pull_requests: [comment, review, merge]
+      branches:
+        push:   ["agent/*"]
+        create: ["agent/*"]
+```
+
+`mode: auto` resolves based on token presence and `repos:` content — no token → `none`, token + empty repos → `unrestricted`, token + non-empty repos → `scoped`. Explicit `mode:` always wins. The CLI mirror is `--github-mode {none,unrestricted,scoped,auto}`. The launcher resolves the merged config (CLI flags additive over yaml) into `workdir/github.json` (`{mode, repos: [{full_name, node_id, issues, pull_requests, branches}]}`) and hands that to the proxy via `--github-policy`. The curated GraphQL operation allowlist lives in a separate bundled file (`proxy/github_policy.yaml`), loaded by the proxy regardless of the network mode.
 
 ## Current limitations and follow-ups
 

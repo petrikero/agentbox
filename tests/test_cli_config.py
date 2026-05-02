@@ -37,11 +37,12 @@ def _ns(
     config: str | None = None,
     network: str | None = None,
     workdir: str | None = None,
+    github_mode: str | None = None,
 ) -> argparse.Namespace:
     """Minimal argparse Namespace with the fields the loader reads."""
     return argparse.Namespace(
         repo=list(repo or []), config=config, network=network,
-        workdir=workdir,
+        workdir=workdir, github_mode=github_mode,
     )
 
 
@@ -181,13 +182,138 @@ class MergeConfigFileTests(unittest.TestCase):
         self.assertIn("'github.repos:' must be a list", str(cm.exception))
 
     def test_non_string_repo_entry_errors(self) -> None:
+        # Repos entries must be strings or mappings; an integer is
+        # neither so the loader rejects the file at parse time.
         self._write_config(
             "github:\n  repos:\n    - my-org/ok\n    - 42\n"
         )
         ns = _ns()
         with self.assertRaises(SystemExit) as cm:
             _merge_config_file(ns)
-        self.assertIn("entries must be strings", str(cm.exception))
+        self.assertIn(
+            "entries must be strings or mappings", str(cm.exception),
+        )
+
+    # ------------------------------------------------------------------
+    # Dict-form repos (per-repo policy)
+    # ------------------------------------------------------------------
+
+    def test_dict_form_repo_parses(self) -> None:
+        self._write_config(
+            "github:\n"
+            "  repos:\n"
+            "    - name: my-org/repo\n"
+            "      issues: [comment, create]\n"
+            "      pull_requests: [comment, review]\n"
+            "      branches:\n"
+            "        push: [\"agent/*\"]\n"
+            "        create: [\"agent/*\"]\n"
+        )
+        ns = _ns()
+        _merge_config_file(ns)
+        self.assertEqual(len(ns.repo), 1)
+        entry = ns.repo[0]
+        self.assertIsInstance(entry, dict)
+        self.assertEqual(entry["name"], "my-org/repo")
+        self.assertEqual(entry["issues"], ["comment", "create"])
+
+    def test_mixed_str_and_dict_repos_merge_with_cli(self) -> None:
+        self._write_config(
+            "github:\n"
+            "  repos:\n"
+            "    - my-org/short\n"
+            "    - name: my-org/full\n"
+            "      issues: [comment]\n"
+        )
+        ns = _ns(repo=["cli/extra"])
+        _merge_config_file(ns)
+        self.assertEqual(len(ns.repo), 3)
+        self.assertEqual(ns.repo[0], "my-org/short")
+        self.assertIsInstance(ns.repo[1], dict)
+        self.assertEqual(ns.repo[1]["name"], "my-org/full")
+        self.assertEqual(ns.repo[2], "cli/extra")
+
+    def test_dict_repo_missing_name_errors(self) -> None:
+        self._write_config(
+            "github:\n  repos:\n    - issues: [comment]\n"
+        )
+        ns = _ns()
+        with self.assertRaises(SystemExit) as cm:
+            _merge_config_file(ns)
+        self.assertIn(
+            "missing required string field 'name'", str(cm.exception),
+        )
+
+    def test_dict_repo_non_list_issues_errors(self) -> None:
+        self._write_config(
+            "github:\n"
+            "  repos:\n"
+            "    - name: my-org/repo\n"
+            "      issues: comment\n"
+        )
+        ns = _ns()
+        with self.assertRaises(SystemExit) as cm:
+            _merge_config_file(ns)
+        self.assertIn("'github.repos[].issues'", str(cm.exception))
+
+    def test_dict_repo_branches_not_mapping_errors(self) -> None:
+        self._write_config(
+            "github:\n"
+            "  repos:\n"
+            "    - name: my-org/repo\n"
+            "      branches: agent/*\n"
+        )
+        ns = _ns()
+        with self.assertRaises(SystemExit) as cm:
+            _merge_config_file(ns)
+        self.assertIn(
+            "'github.repos[].branches' must be a mapping",
+            str(cm.exception),
+        )
+
+    def test_dict_repo_branches_push_non_list_errors(self) -> None:
+        self._write_config(
+            "github:\n"
+            "  repos:\n"
+            "    - name: my-org/repo\n"
+            "      branches:\n"
+            "        push: agent/main\n"
+        )
+        ns = _ns()
+        with self.assertRaises(SystemExit) as cm:
+            _merge_config_file(ns)
+        self.assertIn(
+            "'github.repos[].branches.push'", str(cm.exception),
+        )
+
+    # ------------------------------------------------------------------
+    # github.mode key
+    # ------------------------------------------------------------------
+
+    def test_github_mode_loads_when_cli_absent(self) -> None:
+        self._write_config("github:\n  mode: scoped\n")
+        ns = _ns()
+        _merge_config_file(ns)
+        self.assertEqual(ns.github_mode, "scoped")
+
+    def test_github_mode_cli_overrides_config(self) -> None:
+        self._write_config("github:\n  mode: scoped\n")
+        ns = _ns(github_mode="unrestricted")
+        _merge_config_file(ns)
+        self.assertEqual(ns.github_mode, "unrestricted")
+
+    def test_github_mode_invalid_value_errors(self) -> None:
+        self._write_config("github:\n  mode: chaos\n")
+        ns = _ns()
+        with self.assertRaises(SystemExit) as cm:
+            _merge_config_file(ns)
+        self.assertIn("unknown 'github.mode:' value", str(cm.exception))
+
+    def test_github_mode_auto_round_trips(self) -> None:
+        self._write_config("github:\n  mode: auto\n")
+        ns = _ns()
+        _merge_config_file(ns)
+        self.assertEqual(ns.github_mode, "auto")
 
     # ------------------------------------------------------------------
     # Network mode key

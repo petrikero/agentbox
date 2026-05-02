@@ -196,8 +196,8 @@ def _wait_for_proxy_ready(host: str = "127.0.0.1", port: int = _PROXY_PORT,
 def main() -> None:
     creds = _WORKDIR / "credentials.json"
     allowlist = _WORKDIR / "allowlist.yaml"
-    repos = _WORKDIR / "repos.json"
-    for p in (creds, allowlist, repos):
+    github_policy = _WORKDIR / "github.json"
+    for p in (creds, allowlist, github_policy):
         if not p.is_file():
             sys.exit(f"agentbox-sidecar: missing {p}")
 
@@ -224,7 +224,7 @@ def main() -> None:
         "--port", str(_PROXY_PORT),
         "--credentials", str(creds),
         "--allowlist", str(allowlist),
-        "--repos", str(repos),
+        "--github-policy", str(github_policy),
     ]
     if mock_llm_script.is_file():
         proxy_cmd += ["--mock-llm", str(mock_llm_script)]

@@ -26,9 +26,23 @@ The addon is configured by three file paths passed as mitmproxy options:
   per-repo scope) is loaded from ``github_policy.yaml`` next to
   this file by default -- regardless of the network allowlist.
 
-- ``agentbox_repos`` — JSON list of ``{full_name, node_id}`` entries
-  the launcher resolved from the user's PAT (``gh api repos/...``).
-  Drives the per-repo scope check on ``api.github.com/graphql``.
+- ``agentbox_github_policy`` — JSON describing the resolved GitHub
+  access policy::
+
+      {"mode": "scoped",
+       "repos": [{"full_name": "owner/repo",
+                  "node_id": "R_kgDO...",
+                  "issues":        ["*"],
+                  "pull_requests": ["*"],
+                  "branches":      {"push": ["*"], "create": ["*"], "delete": ["*"]}},
+                 ...]}
+
+  ``mode`` is one of ``none`` / ``unrestricted`` / ``scoped`` (the
+  ``auto`` value used in the launcher CLI is always resolved before
+  reaching the proxy). The per-repo lists are read into
+  ``self.repo_policies`` for chunk-3 enforcement; today only
+  ``mode`` and the repo identity (full_name + node_id) are
+  consulted by the existing GraphQL scope check.
 
 Allowlist patterns are fnmatch-style; host matches are case-insensitive.
 
@@ -98,6 +112,16 @@ class AgentboxFilter:
         self.github_config: dict = _load_bundled_github_policy()
         self.allowed_repo_ids: frozenset[str] = frozenset()
         self.allowed_repo_full_names: frozenset[str] = frozenset()
+        # Resolved GitHub access mode (``none`` / ``unrestricted`` /
+        # ``scoped``). Read from agentbox_github_policy and used to
+        # decide whether the GraphQL gate runs (chunk 3).
+        self.github_mode: str = "unrestricted"
+        # Per-repo policy keyed by full_name -- carries
+        # ``{issues, pull_requests, branches}`` lists. Populated by
+        # ``configure`` when the launcher passes a github_policy
+        # JSON. Chunk 3's enforcement layer reads this; chunk 2
+        # only stores it.
+        self.repo_policies: dict[str, dict] = {}
         # Permissive mode: allow all CONNECTs / requests through
         # without consulting domains, url_prefixes, or the GraphQL
         # gate. Credential handlers still run so the GitHub surrogate
@@ -114,9 +138,10 @@ class AgentboxFilter:
             "Path to YAML allowlist with `domains` and `url_prefixes`",
         )
         loader.add_option(
-            "agentbox_repos", str, "",
-            "Path to JSON list of {full_name, node_id} the agent may "
-            "write to via /graphql",
+            "agentbox_github_policy", str, "",
+            "Path to JSON with the resolved GitHub access policy "
+            "({mode, repos: [{full_name, node_id, issues, "
+            "pull_requests, branches}]})",
         )
 
     def configure(self, updates) -> None:
@@ -158,19 +183,39 @@ class AgentboxFilter:
                             f"{len(ops.get('mutations') or [])} mutations, "
                             f"{len(ops.get('subscriptions') or [])} subs)"
                         )
-        if "agentbox_repos" in updates:
-            path = ctx.options.agentbox_repos
+        if "agentbox_github_policy" in updates:
+            path = ctx.options.agentbox_github_policy
             if path:
-                data = json.loads(Path(path).read_text("utf-8")) or []
+                data = json.loads(Path(path).read_text("utf-8")) or {}
+                if isinstance(data, dict):
+                    repos = data.get("repos") or []
+                    self.github_mode = str(
+                        data.get("mode") or "unrestricted"
+                    )
+                else:
+                    # Defensive: the launcher always writes a dict.
+                    # If we ever see a bare list (legacy shape), treat
+                    # it as the repos array with mode=unrestricted.
+                    repos = data
+                    self.github_mode = "unrestricted"
                 self.allowed_repo_ids = frozenset(
-                    str(r["node_id"]) for r in data if r.get("node_id")
+                    str(r["node_id"]) for r in repos if r.get("node_id")
                 )
                 self.allowed_repo_full_names = frozenset(
-                    str(r["full_name"]) for r in data if r.get("full_name")
+                    str(r["full_name"])
+                    for r in repos if r.get("full_name")
                 )
+                self.repo_policies = {
+                    str(r["full_name"]): {
+                        "issues": list(r.get("issues") or []),
+                        "pull_requests": list(r.get("pull_requests") or []),
+                        "branches": dict(r.get("branches") or {}),
+                    }
+                    for r in repos if r.get("full_name")
+                }
                 ctx.log.info(
-                    f"agentbox: loaded {len(self.allowed_repo_ids)} "
-                    f"writable repo(s) for graphql gate"
+                    f"agentbox: github mode={self.github_mode}, "
+                    f"{len(self.allowed_repo_ids)} repo(s)"
                 )
 
     def http_connect(self, flow: http.HTTPFlow) -> None:

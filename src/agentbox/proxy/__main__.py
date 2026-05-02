@@ -32,9 +32,11 @@ def main() -> None:
     parser.add_argument("--credentials", required=True)
     parser.add_argument("--allowlist", required=True)
     parser.add_argument(
-        "--repos", required=True,
-        help="Path to JSON list of {full_name, node_id} for GitHub repos "
-             "the agent is permitted to write to via /graphql.",
+        "--github-policy", required=True,
+        help="Path to JSON describing the resolved GitHub access policy: "
+             "{mode, repos: [{full_name, node_id, issues, pull_requests, "
+             "branches}]}. The chunk-3 enforcement layer reads the "
+             "per-repo lists; chunk 2 only consumes mode + repo identity.",
     )
     parser.add_argument("--listen-host", default="127.0.0.1")
     parser.add_argument(
@@ -84,7 +86,7 @@ def main() -> None:
             "-s", str(filter_path),
             "--set", f"agentbox_credentials={args.credentials}",
             "--set", f"agentbox_allowlist={args.allowlist}",
-            "--set", f"agentbox_repos={args.repos}",
+            "--set", f"agentbox_github_policy={args.github_policy}",
             *extra_set,
         ]
     else:
@@ -95,7 +97,7 @@ def main() -> None:
             "-s", str(filter_path),
             "--set", f"agentbox_credentials={args.credentials}",
             "--set", f"agentbox_allowlist={args.allowlist}",
-            "--set", f"agentbox_repos={args.repos}",
+            "--set", f"agentbox_github_policy={args.github_policy}",
             *extra_set,
         ]
     mitmdump()

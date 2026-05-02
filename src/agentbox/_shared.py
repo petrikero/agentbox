@@ -60,6 +60,24 @@ NETWORK_MODES: tuple[str, ...] = (
 )
 DEFAULT_NETWORK_MODE = "permissive"
 
+# GitHub access modes accepted by --github-mode and the `github.mode`
+# config key. `auto` (default) resolves to one of the other three based
+# on token presence and `github.repos:` content:
+#
+#   - no token             -> none           (public reads only)
+#   - token, repos empty   -> unrestricted   (full PAT capability)
+#   - token, repos non-empty -> scoped       (writes fenced to listed repos)
+#
+# Explicit `mode:` always wins. `mode: scoped` with empty `repos:` is
+# valid -- reads-everywhere, writes-nowhere.
+GITHUB_MODES: tuple[str, ...] = (
+    "none",
+    "unrestricted",
+    "scoped",
+    "auto",
+)
+DEFAULT_GITHUB_MODE = "auto"
+
 
 # Windows + Git Bash (MSYS) rewrites Unix-style path arguments to native
 # binaries: ``-v /agentbox:/agentbox`` becomes ``-v C:/Program Files/Git/agentbox:...``,

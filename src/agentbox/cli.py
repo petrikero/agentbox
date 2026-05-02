@@ -12,8 +12,9 @@ The launcher:
    (Docker's layer cache keeps no-op rebuilds near-instant; ``--no-cache``
    forwards through for a clean rebuild).
 3. Writes a ``credentials.json`` (per-provider surrogate/real pairs), a
-   ``repos.json`` (writable GitHub repos resolved to ``{full_name,
-   node_id}``), and a copy of the resolved allowlist to a tempdir.
+   ``github.json`` (resolved access mode + per-repo policy with
+   ``{full_name, node_id, issues, pull_requests, branches}``), and a
+   copy of the resolved allowlist to a tempdir.
 4. Ensures mitmproxy's CA cert exists, generating it if needed.
 5. Starts ``python -m agentbox.proxy`` as a subprocess on a free local port.
 6. Runs ``docker run`` with the chosen mode's entrypoint, mounting the cwd
@@ -57,7 +58,9 @@ from agentbox.progress.pi import tail_session_file
 from agentbox._shared import (
     BASE_IMAGE_TAG,
     CONFIG_FILE_NAME,
+    DEFAULT_GITHUB_MODE,
     DEFAULT_NETWORK_MODE,
+    GITHUB_MODES,
     NETWORK_MODES,
     PROJECT_DOCKERFILE_NAME,
     PROJECT_IMAGE_PREFIX,
@@ -89,6 +92,31 @@ def _short(p: Path | str) -> str:
     s = str(p)
     home = str(Path.home())
     return "~" + s[len(home):] if s.startswith(home) else s
+
+
+def _github_mode_summary(
+    mode: str, repos: list[dict], gh_user: str,
+) -> str:
+    """One-line description of the resolved GitHub mode for the banner."""
+    if mode == "none":
+        return "none  [dim](public reads only — no token resolved)[/]"
+    if mode == "unrestricted":
+        suffix = f" → {gh_user}" if gh_user else ""
+        return (
+            f"unrestricted  [dim](token{suffix}; no per-repo fence)[/]"
+        )
+    if mode == "scoped":
+        if not repos:
+            return (
+                "scoped  [dim](no repos — reads everywhere, "
+                "writes nowhere)[/]"
+            )
+        names = ", ".join(r["full_name"] for r in repos)
+        n = len(repos)
+        return (
+            f"scoped  [dim]({n} repo{'s' if n != 1 else ''}: {names})[/]"
+        )
+    return mode
 
 
 def _network_mode_summary(mode: str) -> str:
@@ -185,9 +213,12 @@ def _main(argv: list[str] | None) -> None:
     )
 
     real_token, token_source = _resolve_real_token()
+    gh_user = _lookup_gh_user(real_token) if real_token else ""
     if real_token:
-        user = _lookup_gh_user(real_token)
-        _step("token", f"{token_source}" + (f" → {user}" if user else ""))
+        _step(
+            "token",
+            f"{token_source}" + (f" → {gh_user}" if gh_user else ""),
+        )
     else:
         _step(
             "token",
@@ -211,13 +242,14 @@ def _main(argv: list[str] | None) -> None:
     _step("allowlist", allowlist_summary)
 
     resolved_repos = _resolve_repos(args.repo, real_token)
-    _write_repos(workdir / "repos.json", resolved_repos)
-    if resolved_repos:
-        _step(
-            "repos",
-            ", ".join(r["full_name"] for r in resolved_repos)
-            + "  [dim](writable via /graphql)[/]",
-        )
+    github_mode = _resolve_github_mode(
+        getattr(args, "github_mode", None), real_token, resolved_repos,
+    )
+    args.github_mode = github_mode  # so doctor and downstream see resolved value
+    _write_github_policy(workdir / "github.json", github_mode, resolved_repos)
+    _step(
+        "github", _github_mode_summary(github_mode, resolved_repos, gh_user),
+    )
 
     ca_path = _ensure_mitmproxy_ca()
 
@@ -386,6 +418,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--github-mode", default=None, choices=list(GITHUB_MODES),
+        metavar="MODE",
+        help=(
+            "GitHub access mode. auto (default) resolves based on token "
+            "presence and `github.repos:` from config: no token -> none "
+            "(public reads only); token + no repos -> unrestricted (full "
+            "PAT capability); token + repos -> scoped (writes fenced to "
+            "listed repos). Explicit values: none, unrestricted, scoped. "
+            "Wins over `github.mode` from the config file."
+        ),
+    )
+    parser.add_argument(
         "--mock-llm", default=None, metavar="PATH",
         help=(
             "Path to a Python module that scripts mock LLM responses. "
@@ -468,6 +512,68 @@ def _write_credentials(path: Path, surrogate: str, real_token: str) -> None:
     path.write_text(json.dumps(data), encoding="utf-8")
 
 
+_REPO_OP_KEYS: tuple[str, ...] = ("issues", "pull_requests")
+_BRANCH_OP_KEYS: tuple[str, ...] = ("push", "create", "delete")
+
+
+def _validate_repo_policy_dict(config_path: Path, entry: dict) -> None:
+    """Validate the dict-form ``github.repos[]`` entry shape.
+
+    Exits with a clear error on any structural problem. The accepted
+    shape is::
+
+        - name: owner/repo                  # required string
+          issues:        [comment, ...]     # optional list of strings
+          pull_requests: [comment, ...]     # optional list of strings
+          branches:                          # optional mapping
+            push:   ["agent/*"]              # optional list of strings
+            create: ["agent/*"]              # optional list of strings
+            delete: ["agent/*"]              # optional list of strings
+
+    The op vocabulary itself is intentionally not validated here --
+    chunk-3 enforcement reads these lists, and we'd rather pass an
+    unknown op token through to the proxy (where it'll just never
+    match an operation) than reject it at config-load time and lock
+    users out of agentbox upgrades that introduce new op tokens.
+    """
+    name = entry.get("name")
+    if not isinstance(name, str) or not name:
+        sys.exit(
+            f"agentbox: {config_path}: 'github.repos[]' dict entry "
+            f"missing required string field 'name', got {entry!r}"
+        )
+    for key in _REPO_OP_KEYS:
+        if key not in entry:
+            continue
+        value = entry[key]
+        if not isinstance(value, list) or not all(
+            isinstance(v, str) for v in value
+        ):
+            sys.exit(
+                f"agentbox: {config_path}: 'github.repos[].{key}' must "
+                f"be a list of strings, got {value!r}"
+            )
+    if "branches" in entry:
+        branches = entry["branches"]
+        if not isinstance(branches, dict):
+            sys.exit(
+                f"agentbox: {config_path}: 'github.repos[].branches' "
+                f"must be a mapping, got {branches!r}"
+            )
+        for key in _BRANCH_OP_KEYS:
+            if key not in branches:
+                continue
+            value = branches[key]
+            if not isinstance(value, list) or not all(
+                isinstance(v, str) for v in value
+            ):
+                sys.exit(
+                    f"agentbox: {config_path}: "
+                    f"'github.repos[].branches.{key}' must be a list "
+                    f"of strings, got {value!r}"
+                )
+
+
 def _merge_config_file(args: argparse.Namespace) -> Path | None:
     """Load ``agentbox.config.yaml`` and fold its values into ``args``.
 
@@ -479,25 +585,32 @@ def _merge_config_file(args: argparse.Namespace) -> Path | None:
       a missing file is a silent no-op (the common case for users
       who haven't set one up yet).
 
-    Today ``github.repos``, ``network``, and ``workdir`` are read.
-    ``github.repos`` is *additive* over ``--repo`` CLI flags (file
-    entries first, CLI appended); ``network`` and ``workdir`` only
-    apply when the matching CLI flag wasn't given. Other top-level
-    keys are silently kept aside for future schema growth -- a typo
-    in an unknown section won't surface as an error here, by design,
-    so configs from a newer agentbox load on an older one.
+    Today ``github.{mode,repos}``, ``network``, and ``workdir`` are
+    read. ``github.repos`` is *additive* over ``--repo`` CLI flags
+    (file entries first, CLI appended); ``github.mode``, ``network``,
+    and ``workdir`` only apply when the matching CLI flag wasn't
+    given. Other top-level keys are silently kept aside for future
+    schema growth -- a typo in an unknown section won't surface as
+    an error here, by design, so configs from a newer agentbox load
+    on an older one.
 
-    TODO(policy-language): ``repos:`` is a flat list of full-names
-    today. We need a richer per-repo policy object that can express
-    "writes to PRs in [42, 47] only", "writes to branches matching
-    agent/* only", "addComment but not closeIssue", "issues
-    authored by the agent only", etc. The scope check (Layer 2)
-    already decodes the per-object DB ID inside the node ID, so the
-    enforcement plumbing exists -- this TODO is about the surface
-    language and the launcher-side resolution (e.g. `gh api
-    repos/X/Y/pulls/N --jq .id` per allowlisted PR). See the
+    ``github.repos[]`` accepts two entry shapes:
+
+    - String shorthand: ``"owner/name"`` -- writes-only fence applies
+      but every operation is allowed inside.
+    - Dict form: ``{name, issues?, pull_requests?, branches?}`` --
+      per-operation allowlist; absent keys default to ``["*"]``
+      (full access). The chunk-3 enforcement layer reads these
+      lists; chunk 2 just preserves them through the pipeline.
+
+    TODO(policy-language): the per-repo dict-form fields above are
+    still relatively flat. We eventually want richer expressions
+    like ``branches_matching: ["agent/*", "!main"]``,
+    ``issue_authors: [@me]``, ``dangerous_overrides: [...]``. The
+    scope check (Layer 2) already decodes per-object DB IDs inside
+    node IDs, so the enforcement substrate is in place. See
     matching markers in ``proxy/graphql_scope.py``,
-    ``proxy/allowlist.yaml``, and ``docs/design.md``.
+    ``proxy/github_policy.yaml``, and ``docs/design.md``.
 
     Returns the resolved path of the config file used (for the
     startup banner), or ``None`` if no config was loaded.
@@ -524,19 +637,35 @@ def _merge_config_file(args: argparse.Namespace) -> Path | None:
     if not isinstance(github, dict):
         sys.exit(f"agentbox: {path}: 'github:' must be a mapping")
 
+    if "mode" in github:
+        config_mode = github.get("mode")
+        if config_mode is not None and config_mode not in GITHUB_MODES:
+            sys.exit(
+                f"agentbox: {path}: unknown 'github.mode:' value "
+                f"{config_mode!r}; expected one of "
+                f"{', '.join(GITHUB_MODES)}"
+            )
+        if getattr(args, "github_mode", None) is None:
+            args.github_mode = config_mode
+
     config_repos = github.get("repos") or []
     if not isinstance(config_repos, list):
         sys.exit(f"agentbox: {path}: 'github.repos:' must be a list")
     for r in config_repos:
-        if not isinstance(r, str):
-            sys.exit(
-                f"agentbox: {path}: 'github.repos[]' entries must be "
-                f"strings, got {r!r}"
-            )
+        if isinstance(r, str):
+            continue
+        if isinstance(r, dict):
+            _validate_repo_policy_dict(path, r)
+            continue
+        sys.exit(
+            f"agentbox: {path}: 'github.repos[]' entries must be "
+            f"strings or mappings, got {r!r}"
+        )
 
     # Additive: file entries first, CLI flags appended. Order matters
     # only for the startup log line ("repos: ...") -- the proxy
-    # treats the set as unordered.
+    # treats the set as unordered. Mixed str / dict entries are
+    # preserved as-is and normalised later in `_resolve_repos`.
     args.repo = list(config_repos) + list(args.repo or [])
 
     # Network mode: validated at config-load time so a typo in the YAML
@@ -570,8 +699,41 @@ def _merge_config_file(args: argparse.Namespace) -> Path | None:
     return path
 
 
-def _resolve_repos(repos: list[str], real_token: str) -> list[dict]:
-    """Resolve each ``OWNER/NAME`` to ``{full_name, node_id}``.
+_DEFAULT_REPO_POLICY: dict = {
+    "issues": ["*"],
+    "pull_requests": ["*"],
+    "branches": {"push": ["*"], "create": ["*"], "delete": ["*"]},
+}
+
+
+def _normalize_repo_entry(entry: str | dict) -> dict:
+    """Lift a config-yaml ``github.repos[]`` entry into the canonical dict.
+
+    String shorthand expands to the full-access policy; dict-form
+    entries inherit defaults for keys they don't specify. The
+    returned dict carries the per-repo policy and the spec to
+    resolve to a node ID.
+    """
+    if isinstance(entry, str):
+        return {"name": entry, **_DEFAULT_REPO_POLICY}
+    out: dict = {"name": entry["name"]}
+    out["issues"] = list(entry.get("issues", _DEFAULT_REPO_POLICY["issues"]))
+    out["pull_requests"] = list(
+        entry.get("pull_requests", _DEFAULT_REPO_POLICY["pull_requests"])
+    )
+    branches_default = _DEFAULT_REPO_POLICY["branches"]
+    branches = entry.get("branches") or {}
+    out["branches"] = {
+        key: list(branches.get(key, branches_default[key]))
+        for key in _BRANCH_OP_KEYS
+    }
+    return out
+
+
+def _resolve_repos(
+    repos: list[str | dict], real_token: str,
+) -> list[dict]:
+    """Resolve each ``OWNER/NAME`` (or dict-form policy) to a full repo entry.
 
     Hits ``GET /repos/{owner}/{name}`` with the user's real PAT via
     ``gh api`` so the proxy can verify GraphQL writes target only
@@ -579,6 +741,13 @@ def _resolve_repos(repos: list[str], real_token: str) -> list[dict]:
     launcher: we'd rather refuse to start than silently load a
     permissive (empty allow-set) GraphQL gate when the user clearly
     asked for one.
+
+    Each input entry may be either an ``OWNER/NAME`` string
+    (shorthand for the full-access per-repo policy) or a dict
+    ``{name, issues?, pull_requests?, branches?}`` from the
+    config-yaml. Returned dicts carry ``{full_name, node_id,
+    issues, pull_requests, branches}`` -- ready to write to
+    ``github.json`` and consume in the proxy.
     """
     if not repos:
         return []
@@ -590,7 +759,9 @@ def _resolve_repos(repos: list[str], real_token: str) -> list[dict]:
     env = os.environ.copy()
     env["GH_TOKEN"] = real_token
     resolved: list[dict] = []
-    for spec in repos:
+    for raw in repos:
+        normalized = _normalize_repo_entry(raw)
+        spec = normalized["name"]
         if "/" not in spec:
             sys.exit(f"agentbox: --repo expects OWNER/NAME, got {spec!r}")
         try:
@@ -619,13 +790,64 @@ def _resolve_repos(repos: list[str], real_token: str) -> list[dict]:
                 f"agentbox: gh api repos/{spec} missing node_id/full_name "
                 f"({payload!r})"
             )
-        resolved.append({"node_id": node_id, "full_name": full_name})
+        resolved.append({
+            "full_name": full_name,
+            "node_id": node_id,
+            "issues": normalized["issues"],
+            "pull_requests": normalized["pull_requests"],
+            "branches": normalized["branches"],
+        })
     return resolved
 
 
-def _write_repos(path: Path, repos: list[dict]) -> None:
-    """Write the writable-repos JSON consumed by the proxy filter."""
-    path.write_text(json.dumps(repos), encoding="utf-8")
+def _resolve_github_mode(
+    explicit: str | None, real_token: str, repos: list[dict],
+) -> str:
+    """Map (explicit mode, token presence, repos) onto a concrete mode.
+
+    Explicit ``none``/``unrestricted``/``scoped`` always wins.
+    ``auto`` (or unset) resolves per the table:
+
+    +--------------+-------------+----------------+
+    | token        | repos       | resolved mode  |
+    +==============+=============+================+
+    | absent       | (any)       | ``none``       |
+    | present      | empty       | ``unrestricted`` |
+    | present      | non-empty   | ``scoped``     |
+    +--------------+-------------+----------------+
+
+    ``mode: scoped`` with empty ``repos`` is valid -- it means
+    reads-everywhere, writes-nowhere, which is a useful safe
+    default once chunk 3's writes-only fence lands.
+    """
+    if explicit and explicit != "auto":
+        return explicit
+    if not real_token:
+        return "none"
+    return "scoped" if repos else "unrestricted"
+
+
+def _write_github_policy(
+    path: Path, mode: str, repos: list[dict],
+) -> None:
+    """Write the GitHub access policy JSON consumed by the proxy filter.
+
+    Schema::
+
+        {
+          "mode": "<none|unrestricted|scoped>",
+          "repos": [
+            {full_name, node_id, issues, pull_requests, branches},
+            ...
+          ]
+        }
+
+    ``mode`` is the resolved value (never ``auto`` -- that's
+    expanded by ``_resolve_github_mode``). Chunk-3 enforcement
+    reads this same shape; chunk 2 only produces it.
+    """
+    payload = {"mode": mode, "repos": repos}
+    path.write_text(json.dumps(payload), encoding="utf-8")
 
 
 def _copy_allowlist(dst: Path, source: str | None = None) -> str:
@@ -720,7 +942,7 @@ def _start_proxy(
         "--port", str(port),
         "--credentials", str(workdir / "credentials.json"),
         "--allowlist", str(workdir / "allowlist.yaml"),
-        "--repos", str(workdir / "repos.json"),
+        "--github-policy", str(workdir / "github.json"),
     ]
     if mock_llm:
         cmd += ["--mock-llm", mock_llm]
@@ -911,7 +1133,7 @@ def _stage_sidecar_files(workdir: Path, ca_path: Path) -> Path:
        0o700 owned by the host UID. The sidecar's mitmproxy bind-mounts
        it ro at ``/agentbox/proxy``; without a chmod here the sidecar
        can't even traverse the dir, let alone read credentials.json /
-       allowlist.yaml / repos.json. We relax to dir 0o755 + files
+       allowlist.yaml / github.json. We relax to dir 0o755 + files
        0o644. The data inside (surrogate-mapped real PAT, allowlist,
        repo list) is per-session and the workdir lives under /tmp on
        a single-user host -- bounded blast radius.
@@ -930,7 +1152,7 @@ def _stage_sidecar_files(workdir: Path, ca_path: Path) -> Path:
     ``docker run -v``.
     """
     workdir.chmod(0o755)
-    for fname in ("credentials.json", "allowlist.yaml", "repos.json"):
+    for fname in ("credentials.json", "allowlist.yaml", "github.json"):
         path = workdir / fname
         if path.exists():
             path.chmod(0o644)

@@ -540,5 +540,86 @@ class GraphqlGateTests(unittest.TestCase):
         )
 
 
+class GithubPolicyConfigureTests(unittest.TestCase):
+    """Coverage for AgentboxFilter.configure() loading github.json.
+
+    The launcher writes ``{mode, repos: [{full_name, node_id, issues,
+    pull_requests, branches}]}`` to a per-session JSON file and points
+    the proxy at it via the ``agentbox_github_policy`` mitmproxy
+    option. configure() should populate self.github_mode,
+    self.allowed_repo_*, and self.repo_policies.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = Path(__file__).resolve().parent / "_tmp_github_policy"
+        self._tmp.mkdir(exist_ok=True)
+        self._patch = patch.object(
+            filter_mod, "ctx",
+            SimpleNamespace(
+                log=SimpleNamespace(
+                    info=lambda *a, **k: None,
+                    warn=lambda *a, **k: None,
+                ),
+                options=SimpleNamespace(),
+            ),
+        )
+        self._patch.start()
+
+    def tearDown(self) -> None:
+        self._patch.stop()
+        for p in self._tmp.glob("*"):
+            p.unlink()
+        self._tmp.rmdir()
+
+    def _write_policy(self, payload: dict) -> Path:
+        path = self._tmp / "github.json"
+        path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def test_loads_dict_form_repos(self) -> None:
+        path = self._write_policy({
+            "mode": "scoped",
+            "repos": [
+                {
+                    "full_name": "my-org/repo",
+                    "node_id": "R_kgDO_test",
+                    "issues": ["comment", "create"],
+                    "pull_requests": ["comment", "review"],
+                    "branches": {
+                        "push": ["agent/*"], "create": [], "delete": [],
+                    },
+                },
+            ],
+        })
+        f = AgentboxFilter()
+        filter_mod.ctx.options.agentbox_github_policy = str(path)
+        f.configure({"agentbox_github_policy"})
+        self.assertEqual(f.github_mode, "scoped")
+        self.assertEqual(f.allowed_repo_ids, frozenset({"R_kgDO_test"}))
+        self.assertEqual(
+            f.allowed_repo_full_names, frozenset({"my-org/repo"}),
+        )
+        policy = f.repo_policies["my-org/repo"]
+        self.assertEqual(policy["issues"], ["comment", "create"])
+        self.assertEqual(policy["pull_requests"], ["comment", "review"])
+        self.assertEqual(policy["branches"]["push"], ["agent/*"])
+
+    def test_unrestricted_with_no_repos(self) -> None:
+        path = self._write_policy({"mode": "unrestricted", "repos": []})
+        f = AgentboxFilter()
+        filter_mod.ctx.options.agentbox_github_policy = str(path)
+        f.configure({"agentbox_github_policy"})
+        self.assertEqual(f.github_mode, "unrestricted")
+        self.assertEqual(f.allowed_repo_ids, frozenset())
+        self.assertEqual(f.repo_policies, {})
+
+    def test_none_mode_loads(self) -> None:
+        path = self._write_policy({"mode": "none", "repos": []})
+        f = AgentboxFilter()
+        filter_mod.ctx.options.agentbox_github_policy = str(path)
+        f.configure({"agentbox_github_policy"})
+        self.assertEqual(f.github_mode, "none")
+
+
 if __name__ == "__main__":
     unittest.main()

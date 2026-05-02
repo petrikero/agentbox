@@ -178,7 +178,11 @@ def _section_config(
         rep.ok("config", str(config_path))
 
     cli_repos = list(args.repo or [])
-    rep.info("--repo", ", ".join(cli_repos) if cli_repos else "(none)")
+    rep.info(
+        "--repo",
+        ", ".join(_repo_entry_name(r) for r in cli_repos)
+        if cli_repos else "(none)",
+    )
 
 
 def _section_credentials(
@@ -208,28 +212,69 @@ def _section_credentials(
     )
 
 
-def _section_repos(
+def _repo_entry_name(entry: str | dict) -> str:
+    """Extract the OWNER/NAME from a config-yaml repos entry (str or dict)."""
+    if isinstance(entry, str):
+        return entry
+    return str(entry.get("name") or "(unnamed)")
+
+
+def _section_github(
     rep: _Reporter,
-    repos: list[str],
+    args: argparse.Namespace,
+    repos: list[str | dict],
     real_token: str,
 ) -> None:
-    rep.header("GraphQL writable repos")
+    """Resolved GitHub access mode + per-repo policy."""
+    rep.header("GitHub access")
+
+    explicit = getattr(args, "github_mode", None)
+    rep.info(
+        "configured mode",
+        explicit if explicit else "(none / auto)",
+    )
+
+    # Mirror cli._resolve_github_mode without importing (avoids a
+    # cli <- doctor cycle today).
+    if explicit and explicit != "auto":
+        resolved = explicit
+    elif not real_token:
+        resolved = "none"
+    elif repos:
+        resolved = "scoped"
+    else:
+        resolved = "unrestricted"
+    rep.ok("resolved mode", resolved)
+
     if not repos:
         rep.info(
-            "writable",
-            "(none) [dim]-- all GraphQL mutations will 403 with "
-            "scope_out_of_scope[/]",
-        )
-        rep.info(
-            "reads",
-            "still allowed against any repo your token can see "
-            "(token is the outer fence)",
+            "repos",
+            "(none) [dim]-- in scoped mode, all GraphQL mutations would "
+            "403 with scope_out_of_scope[/]",
         )
         return
 
     rep.ok("count", f"{len(repos)} repo(s)")
-    for spec in repos:
-        rep.info("repo", spec)
+    for entry in repos:
+        name = _repo_entry_name(entry)
+        if isinstance(entry, str):
+            rep.info("repo", f"{name} [dim](shorthand: full access)[/]")
+        else:
+            rep.info("repo", name)
+            issues = entry.get("issues")
+            prs = entry.get("pull_requests")
+            branches = entry.get("branches")
+            if issues is not None:
+                rep.info("", f"  [dim]issues:[/] {', '.join(map(str, issues))}")
+            if prs is not None:
+                rep.info("", f"  [dim]pull_requests:[/] {', '.join(map(str, prs))}")
+            if isinstance(branches, dict):
+                bits = ", ".join(
+                    f"{k}={v}" for k, v in branches.items() if v
+                )
+                if bits:
+                    rep.info("", f"  [dim]branches:[/] {bits}")
+
     if not real_token:
         rep.error(
             "--repo / config repos set but no GitHub token resolved -- "
@@ -284,6 +329,26 @@ def _section_allowlist(
     return data, str(src)
 
 
+def _load_github_policy(rep: _Reporter, allowlist_data: dict) -> dict:
+    """Resolve which GitHub policy YAML the proxy will load.
+
+    A user-supplied allowlist's ``github:`` block (if present)
+    replaces the bundled ``github_policy.yaml`` for that session;
+    otherwise the bundled defaults apply.
+    """
+    if "github" in allowlist_data:
+        return allowlist_data.get("github") or {}
+    bundled = Path(__file__).parent / "proxy" / "github_policy.yaml"
+    if not bundled.is_file():
+        rep.error(f"bundled github_policy.yaml missing at {bundled}")
+        return {}
+    try:
+        return yaml.safe_load(bundled.read_text("utf-8")) or {}
+    except yaml.YAMLError as exc:
+        rep.error(f"github_policy.yaml parse error: {exc}")
+        return {}
+
+
 def _section_graphql_gate(rep: _Reporter, allowlist_data: dict) -> None:
     rep.header("GraphQL gate (api.github.com/graphql)")
     if allowlist_data.get("permissive"):
@@ -292,11 +357,11 @@ def _section_graphql_gate(rep: _Reporter, allowlist_data: dict) -> None:
             "[dim]bypassed -- allowlist is in permissive mode[/]",
         )
         return
-    github = allowlist_data.get("github") or {}
+    github = _load_github_policy(rep, allowlist_data)
     if not github:
         rep.warn(
-            "no `github:` block in the allowlist -- the GraphQL gate "
-            "is INACTIVE; all /graphql requests pass through unchecked"
+            "github policy is empty -- the GraphQL gate is INACTIVE; "
+            "all /graphql requests pass through unchecked"
         )
         return
     rep.ok("status", "active")
@@ -479,7 +544,7 @@ def _section_network(rep: _Reporter, args: argparse.Namespace) -> None:
 
 def _section_runtime_summary(
     rep: _Reporter,
-    repos: list[str],
+    repos: list[str | dict],
     allowlist: dict,
     real_token: str,
 ) -> None:
@@ -510,13 +575,14 @@ def _section_runtime_summary(
             "(no host token resolved)"
         )
 
-    github = allowlist.get("github") or {}
+    github = _load_github_policy(rep, allowlist)
     ops = github.get("graphql_operations") or {}
     n_mut = len(ops.get("mutations") or [])
     if not permissive and repos and n_mut:
+        names = ", ".join(_repo_entry_name(r) for r in repos)
         rep.console.print(
             f"    [dim]·[/] GraphQL writes ({n_mut} listed mutation "
-            f"pattern(s)) targeting: {', '.join(repos)}"
+            f"pattern(s)) targeting: {names}"
         )
     if permissive:
         rep.console.print(
@@ -649,11 +715,13 @@ def _gh_user(token: str) -> str:
 # ----------------------------------------------------------------------------
 
 
-def _combined_repos(args: argparse.Namespace) -> list[str]:
+def _combined_repos(args: argparse.Namespace) -> list[str | dict]:
     """Match the launcher's behaviour: config-file repos came first into
     ``args.repo`` via ``_merge_config_file``; that's already the
-    combined list. This helper exists so the section runners don't
-    have to reach into argparse internals.
+    combined list. Entries may be either ``"OWNER/NAME"`` strings
+    (CLI ``--repo`` shorthand) or dict-form policy objects (config
+    yaml). This helper exists so the section runners don't have to
+    reach into argparse internals.
     """
     return list(args.repo or [])
 
@@ -676,7 +744,7 @@ def run(args: argparse.Namespace, config_path: Path | None) -> int:
 
     _section_config(rep, args, config_path)
     _section_credentials(rep, real_token, token_source)
-    _section_repos(rep, repos, real_token)
+    _section_github(rep, args, repos, real_token)
     allowlist_data, _ = _section_allowlist(rep, args)
     _section_graphql_gate(rep, allowlist_data)
     _section_image(rep)
