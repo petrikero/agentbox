@@ -68,6 +68,7 @@ def _docker_available() -> tuple[bool, str]:
         proc = subprocess.run(
             ["docker", "info"],
             capture_output=True, text=True, timeout=10, check=False,
+            encoding="utf-8", errors="replace",
         )
     except FileNotFoundError:
         return False, "docker CLI not on PATH"
@@ -131,6 +132,7 @@ def _ensure_base_image() -> None:
     proc = subprocess.run(
         ["docker", "build", "-t", _BASE_IMAGE_TAG, str(_BASE_DOCKERFILE_DIR)],
         capture_output=True, text=True, check=False,
+        encoding="utf-8", errors="replace",
     )
     if proc.returncode != 0:
         tail = "\n".join((proc.stderr or proc.stdout or "").splitlines()[-20:])
