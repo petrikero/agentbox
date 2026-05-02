@@ -4,7 +4,7 @@
 # compose by chaining (e.g. `make lint typecheck`). Windows users without
 # `make` can run the underlying commands directly.
 
-PYTHON ?= python
+PYTHON ?= uv run python
 
 .DEFAULT_GOAL := help
 .PHONY: help test test-fast check build clean
