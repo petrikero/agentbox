@@ -51,9 +51,17 @@ RUN GH_VERSION=$(curl -fsSL https://api.github.com/repos/cli/cli/releases/latest
  && mv "/tmp/gh_${GH_VERSION}_linux_${TARGETARCH}/bin/gh" /usr/local/bin/gh \
  && rm -rf "/tmp/gh_${GH_VERSION}_linux_${TARGETARCH}"
 
-RUN npm install -g \
-      @mariozechner/pi-coding-agent@latest \
-      @anthropic-ai/claude-code@latest
+RUN npm install -g @mariozechner/pi-coding-agent@latest
+
+# Claude records the host's install method in ~/.claude.json, which is
+# bind-mounted into the container at run time. The native installer
+# (curl|bash from claude.ai/install.sh) is the default on macOS, Linux,
+# WSL, and Windows, so most hosts record installMethod="native" and
+# expect the binary at ~/.local/bin/claude. We install claude with the
+# same native installer below (after the agentbox user is created), so
+# the in-container install matches what the host config describes --
+# no symlink fakery, and ~/.local/bin/claude is the real binary.
+ENV PATH=/home/agentbox/.local/bin:${PATH}
 
 # Git credential helper: emit x-access-token:$GH_TOKEN so https git
 # operations against GitHub authenticate via the agentbox surrogate. The
@@ -77,6 +85,18 @@ RUN groupadd --gid 1000 agentbox \
  && useradd  --uid 1000 --gid 1000 --create-home --shell /bin/bash agentbox \
  && install -d -o agentbox -g agentbox \
       /home/agentbox/.pi /home/agentbox/.claude /agentbox
+
+# Native install of Claude Code as the agentbox user. install.sh
+# downloads the platform binary into ~/.claude/downloads/ and the
+# binary's `install` subcommand places it at ~/.local/bin/claude --
+# matching installMethod="native" recorded in the host's
+# ~/.claude.json that we bind-mount at run time. `runuser -l` runs
+# the install in a login shell so $HOME and $USER point at agentbox.
+# DISABLE_AUTOUPDATER stops claude from trying to self-update at run
+# time inside the sandbox -- the image is the source of truth and
+# the launcher rebuilds it each invocation.
+RUN runuser -l agentbox -c 'set -eo pipefail; curl -fsSL https://claude.ai/install.sh | bash'
+ENV DISABLE_AUTOUPDATER=1
 
 COPY --chown=agentbox:agentbox bashrc /home/agentbox/.bashrc
 
