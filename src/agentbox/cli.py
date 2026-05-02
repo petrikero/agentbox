@@ -1295,6 +1295,14 @@ def _run_agent(
         "-e", f"REQUESTS_CA_BUNDLE={container_ca}",
         "-e", f"CURL_CA_BUNDLE={container_ca}",
     ]
+    # Forward terminal capability env vars so color rendering inside the
+    # container matches the host. Without these, docker -it defaults TERM
+    # to plain "xterm" and drops COLORTERM, so 24-bit-color UIs (claude,
+    # rich-based tools) fall back to a 16-color palette.
+    for var in ("TERM", "COLORTERM", "LANG", "LC_ALL"):
+        val = os.environ.get(var)
+        if val:
+            cmd += ["-e", f"{var}={val}"]
     if mode == "pi":
         cmd += ["-v", f"{pi_dir.as_posix()}:/home/agentbox/.pi"]
 
