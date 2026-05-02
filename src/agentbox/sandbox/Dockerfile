@@ -6,6 +6,7 @@
 #   - bash is the default shell; CA certs at /usr/local/share/ca-certificates/
 #   - `gh` on PATH (uses GH_TOKEN=<surrogate> via the agentbox proxy)
 #   - `pi` and `claude` on PATH
+#   - `uv` and `uvx` on PATH
 #   - `git-credential-agentbox` on PATH; system gitconfig already wires it up
 #     for github.com / gist.github.com so `git push` over HTTPS works
 #   - WORKDIR /agentbox (launcher overrides per-project at run time);
@@ -27,6 +28,11 @@ COPY --from=node /usr/local/bin/node /usr/local/bin/node
 COPY --from=node /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
  && ln -s /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx
+
+# uv: standalone Python package/project manager. Pulled from the official
+# image so we always get a recent statically-linked binary that doesn't
+# depend on the system Python.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
