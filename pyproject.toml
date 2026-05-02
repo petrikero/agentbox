@@ -7,7 +7,7 @@ name = "agentbox"
 version = "0.1.0"
 description = "Sandbox launcher for AI coding agents with credential-isolating proxy"
 license = "MIT"
-requires-python = ">=3.13"
+requires-python = ">=3.14"
 dependencies = [
     "graphql-core>=3.2.8",
     "mitmproxy>=12.2.2",
@@ -31,7 +31,7 @@ packages = ["src/agentbox"]
 "src/agentbox/proxy/github_policy.yaml" = "agentbox/proxy/github_policy.yaml"
 
 [tool.pyright]
-pythonVersion = "3.13"
+pythonVersion = "3.14"
 typeCheckingMode = "standard"
 include = ["src/", "tests/"]
 extraPaths = ["src"]
@@ -39,7 +39,7 @@ venvPath = "."
 venv = ".venv"
 
 [tool.ruff]
-target-version = "py313"
+target-version = "py314"
 include = ["src/**/*.py", "tests/**/*.py"]
 
 [tool.ruff.lint]

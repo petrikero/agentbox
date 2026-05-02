@@ -599,6 +599,7 @@ class AgentboxFilter:
     def _host_reachable(self, host: str) -> bool:
         if self.permissive:
             return True
+        host = host.lower()
         for pattern in self.domains:
             if fnmatch(host, pattern):
                 return True

@@ -89,6 +89,15 @@ def _capture_run_agent_cmd(
                 mock.patch.object(Path, "home", return_value=fake_home),
                 mock.patch("agentbox.cli.subprocess.Popen", side_effect=_fake_popen),
                 mock.patch("agentbox.cli._is_docker_desktop", return_value=True),
+                # _run_agent shells out to `git config --global` to
+                # forward the host identity. The Popen patch above
+                # would intercept that too, but subprocess.run uses
+                # Popen as a context manager and expects a CompletedProcess
+                # back -- _FakeProc isn't either. The git-identity path
+                # isn't what these tests pin, so stub it out directly.
+                mock.patch(
+                    "agentbox.cli._resolve_git_identity", return_value={},
+                ),
                 # Silence the rich-formatted launcher banner so test
                 # output stays terse.
                 mock.patch("agentbox.cli._console"),

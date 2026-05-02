@@ -70,10 +70,6 @@ def _oos(detail: str) -> ScopeResult:
     return ScopeResult(ScopeVerdict.OUT_OF_SCOPE, detail)
 
 
-def _too_deep() -> ScopeResult:
-    return ScopeResult(ScopeVerdict.PARSE_ERROR, "<too-deep>")
-
-
 class Layer0RepositoryFieldTests(unittest.TestCase):
     """Coverage for the ``repository(owner, name)`` selection check."""
 
@@ -395,29 +391,23 @@ class FailSecureTests(unittest.TestCase):
 class DeeplyNestedVariablesTests(unittest.TestCase):
     """Pathologically nested ``variables`` must not crash the proxy.
 
-    The variable-scan walkers were rewritten from recursive to
-    iterative so a deeply nested body could not blow Python's
-    ~1000-frame default recursion limit. But ``check_repo_scope``
-    still calls ``json.loads`` on the raw body before the walkers
-    ever run, and stdlib ``json`` is itself recursive (one C frame
-    per container). Past ``sys.getrecursionlimit()`` the parser
-    raises ``RecursionError``, which used to escape and 500 the
-    proxy.
+    Both layers in the parse pipeline are iterative on Python 3.14+:
+    the variable-scan walkers (``_collect_*_from_variables``) keep an
+    explicit stack, and stdlib ``json.loads`` no longer recurses one
+    Python frame per container. So a body nested far past
+    ``sys.getrecursionlimit()`` parses cleanly and is then walked
+    cleanly. These tests pin both halves: the walker still finds an
+    out-of-scope ID buried at the bottom of a 5000-deep tree, and a
+    benign deep body lands at ``ALLOWED`` instead of crashing.
 
-    The fix is fail-secure: catch ``RecursionError`` and return a
-    PARSE_ERROR / ``<too-deep>`` verdict so the gate 403s the
-    request. These tests pin that behaviour.
-
-    Bodies are constructed as raw JSON bytes (not via ``json.dumps``,
-    which is also recursive and would crash the test setup itself
-    well before reaching the code under test).
+    Bodies are constructed as raw JSON bytes -- ``json.dumps`` is
+    used for the leaf only, since dumping a 5000-deep structure
+    itself recurses on the dumper side.
     """
 
     _DEPTH = 5000
 
-    def test_deeply_nested_dict_does_not_recurse(self) -> None:
-        # Nest a benign dict 5000 levels deep with no repositoryId
-        # anywhere. json.loads RecursionErrors -> _too_deep().
+    def test_deeply_nested_dict_parses_and_allows(self) -> None:
         body = (
             b'{"query":"query Q { viewer { login } }","variables":'
             + b'{"nested":' * self._DEPTH
@@ -425,11 +415,11 @@ class DeeplyNestedVariablesTests(unittest.TestCase):
             + b"}" * self._DEPTH
             + b"}"
         )
-        self.assertEqual(check_repo_scope(body, ALLOWED_IDS), _too_deep())
+        self.assertEqual(check_repo_scope(body, ALLOWED_IDS), _allowed())
 
-    def test_deeply_nested_list_does_not_recurse(self) -> None:
-        # Same depth but alternating list/dict containers, so the
-        # parser hits both code paths on the way down.
+    def test_deeply_nested_list_parses_and_allows(self) -> None:
+        # Alternating list/dict containers exercise both parser
+        # code paths on the way down.
         opens: list[bytes] = []
         closes: list[bytes] = []
         for i in range(self._DEPTH):
@@ -446,12 +436,12 @@ class DeeplyNestedVariablesTests(unittest.TestCase):
             + b"".join(reversed(closes))
             + b"}}"
         )
-        self.assertEqual(check_repo_scope(body, ALLOWED_IDS), _too_deep())
+        self.assertEqual(check_repo_scope(body, ALLOWED_IDS), _allowed())
 
     def test_deeply_nested_dict_with_oos_payload_rejected(self) -> None:
-        # Even when the leaf hides an out-of-scope subjectId, the
-        # body is rejected at parse time -- the walker never runs,
-        # which is fine because PARSE_ERROR also fails the gate.
+        # Walker is iterative, so a subjectId buried at the bottom of
+        # a 5000-deep tree is still found and the gate rejects the
+        # request as out-of-scope -- not a parse failure.
         leaf = json.dumps({"subjectId": ISSUE_EVIL}).encode()
         body = (
             b'{"query":"mutation Q($input: AddCommentInput!) {'
@@ -462,7 +452,9 @@ class DeeplyNestedVariablesTests(unittest.TestCase):
             + b"}" * self._DEPTH
             + b"}}"
         )
-        self.assertEqual(check_repo_scope(body, ALLOWED_IDS), _too_deep())
+        self.assertEqual(
+            check_repo_scope(body, ALLOWED_IDS), _oos(ISSUE_EVIL),
+        )
 
 
 if __name__ == "__main__":
