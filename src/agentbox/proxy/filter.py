@@ -11,15 +11,20 @@ The addon is configured by three file paths passed as mitmproxy options:
   (Anthropic OAuth, AWS SigV4, ...) get their own handler classes in
   ``handlers.py`` and their own keys here.
 
-- ``agentbox_allowlist`` — YAML with ``domains`` (host-only entries),
-  ``url_prefixes`` (host + path + optional methods), and an optional
-  ``github:`` block carrying the GraphQL operation allowlist. Drives
+- ``agentbox_allowlist`` — YAML with ``domains`` (host-only entries)
+  and ``url_prefixes`` (host + path + optional methods). Drives
   request gating; surrogate handling is decoupled from the allowlist
   so each handler can apply on any allowlisted host that falls in
   its scope. A top-level ``permissive: true`` short-circuits all
   network gating (everything is allowed through) while leaving the
   credential-swap handlers in place -- useful as a default until the
-  scoping policy is dialled in.
+  scoping policy is dialled in. A top-level ``github:`` block, if
+  present, replaces the contents of the bundled
+  ``github_policy.yaml`` for that session.
+
+  GitHub-specific access policy (GraphQL operation allowlist,
+  per-repo scope) is loaded from ``github_policy.yaml`` next to
+  this file by default -- regardless of the network allowlist.
 
 - ``agentbox_repos`` — JSON list of ``{full_name, node_id}`` entries
   the launcher resolved from the user's PAT (``gh api repos/...``).
@@ -62,14 +67,35 @@ _GRAPHQL_HOST = "api.github.com"
 _GRAPHQL_PATH = "/graphql"
 
 
+_BUNDLED_GITHUB_POLICY = Path(__file__).parent / "github_policy.yaml"
+
+
+def _load_bundled_github_policy() -> dict:
+    """Return the bundled GitHub policy dict, or ``{}`` if the file is missing.
+
+    The file ships inside the package, so a missing file is a packaging
+    bug rather than user error -- but we soft-fail so the proxy still
+    starts (with no GraphQL gate) if someone has been editing the
+    install tree.
+    """
+    if not _BUNDLED_GITHUB_POLICY.is_file():
+        return {}
+    try:
+        return yaml.safe_load(_BUNDLED_GITHUB_POLICY.read_text("utf-8")) or {}
+    except yaml.YAMLError:
+        return {}
+
+
 class AgentboxFilter:
     def __init__(self) -> None:
         self.handlers: list[GithubCredentialHandler] = []
         self.domains: list[str] = []
         self.url_prefixes: list[dict] = []
-        # GraphQL gate state. When github_config is empty the gate is
-        # bypassed (caller didn't configure /graphql scoping).
-        self.github_config: dict = {}
+        # GraphQL gate state. Defaults to the bundled github_policy.yaml
+        # so the gate runs with curated operation allowlists out of the
+        # box; a `github:` block in the user-supplied allowlist replaces
+        # this on load.
+        self.github_config: dict = _load_bundled_github_policy()
         self.allowed_repo_ids: frozenset[str] = frozenset()
         self.allowed_repo_full_names: frozenset[str] = frozenset()
         # Permissive mode: allow all CONNECTs / requests through
@@ -110,7 +136,10 @@ class AgentboxFilter:
                 self.permissive = bool(data.get("permissive", False))
                 self.domains = [str(d).lower() for d in data.get("domains") or []]
                 self.url_prefixes = data.get("url_prefixes") or []
-                self.github_config = data.get("github") or {}
+                # User allowlist may override the bundled GitHub policy;
+                # otherwise the bundled defaults loaded in __init__ stay.
+                if "github" in data:
+                    self.github_config = data.get("github") or {}
                 if self.permissive:
                     ctx.log.info(
                         "agentbox: permissive networking active -- "

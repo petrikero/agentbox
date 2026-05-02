@@ -28,6 +28,7 @@ packages = ["src/agentbox"]
 "src/agentbox/sandbox/proxy/entrypoint.py" = "agentbox/sandbox/proxy/entrypoint.py"
 "src/agentbox/sandbox/proxy/dns.py" = "agentbox/sandbox/proxy/dns.py"
 "src/agentbox/proxy/allowlist.yaml" = "agentbox/proxy/allowlist.yaml"
+"src/agentbox/proxy/github_policy.yaml" = "agentbox/proxy/github_policy.yaml"
 
 [tool.pyright]
 pythonVersion = "3.13"

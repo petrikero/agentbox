@@ -95,7 +95,8 @@ agentbox/
         |-- graphql_scope.py
         |-- handlers.py
         |-- node_id.py
-        \-- allowlist.yaml
+        |-- allowlist.yaml
+        \-- github_policy.yaml
 ```
 
 ## Main Modules

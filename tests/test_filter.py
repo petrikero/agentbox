@@ -521,8 +521,12 @@ class GraphqlGateTests(unittest.TestCase):
         self.assertEqual(warn_lines, [])
 
     def test_gate_disabled_when_github_config_empty(self) -> None:
-        # No github_config set -> gate is bypassed even on /graphql.
+        # github_config explicitly cleared -> gate is bypassed even
+        # on /graphql. The default value comes from the bundled
+        # github_policy.yaml; clearing it simulates a user-supplied
+        # allowlist whose `github:` block is an empty mapping.
         f = _make_filter(domains=["api.github.com"])
+        f.github_config = {}
         flow = self._post(
             b'{"query":"mutation { deleteRepository(input: {repositoryId:'
             b' \\"R_evil\\"}) { clientMutationId } }"}'

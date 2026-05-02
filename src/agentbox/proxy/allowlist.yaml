@@ -34,7 +34,11 @@ domains:
   - platform.claude.com
   - console.anthropic.com
 
-  # GitHub: API and web (broad reads + agent operations)
+  # GitHub: API and web (broad reads + agent operations).
+  # GitHub-specific access policy (which GraphQL ops are allowed,
+  # which repos can be written to, ...) is decoupled from this
+  # network allowlist and lives in `github_policy.yaml` next to
+  # this file.
   - api.github.com
   - github.com
   - "*.github.com"
@@ -69,91 +73,8 @@ domains:
 #     path: /your-org/your-repo.git/git-receive-pack
 #     methods: [POST]
 
-# GraphQL gate for api.github.com/graphql (strict mode only).
-#
-# Two layers run on every POST:
-#   1. graphql_operations (default-deny). Any operation type/field name
-#      not on the allowlist is blocked as "unsupported_feature" and
-#      logged so operators can extend the list as GitHub adds features.
-#   2. repos[]. The launcher passes one or more `--repo OWNER/NAME`
-#      flags; mutations whose targeted repo isn't in this list are
-#      blocked as "out_of_scope". Reads (queries) work against any
-#      repo the host's PAT can already see -- the token itself is the
-#      outer fence; the gate just keeps writes inside the named repos.
-#
-# `repos[].pull_requests`, `issues`, and `branches` are reserved for
-# finer-grained future scoping -- the schema parses them today, but
-# v1 enforces only `full_name`.
-github:
-  graphql_operations:
-    queries:
-      # Curated supported-query allowlist. Anything outside this list
-      # returns "unsupported_feature" + structured log line (so the
-      # operator can decide whether to add it).
-      - viewer
-      - repository
-      - organization
-      - user
-      - node
-      - nodes
-      - search
-      - rateLimit
-      - __schema
-      - __type
-    mutations:
-      # Curated supported-mutation allowlist. Default v1 set covers
-      # the common `gh` PR/issue/review flow.
-      - addComment
-      - addLabelsToLabelable
-      - addPullRequestReview
-      - closeIssue
-      - createCommitOnBranch
-      - createIssue
-      - createPullRequest
-      - mergePullRequest
-      - markPullRequestReadyForReview
-      - removeLabelsFromLabelable
-      - reopenIssue
-      - requestReviews
-      - submitPullRequestReview
-      - updateIssue
-      - updatePullRequest
-    subscriptions: []
-    dangerous:
-      # Shadow-mode watchlist. These operations are *not* blocked --
-      # if Layer 2 (scope) says the request targets an allowed repo,
-      # it goes through. But each match emits a WARN log line so
-      # operators can spot agent behaviour worth tightening (drop
-      # the field from `mutations:` above, narrow `repos:`, or fix
-      # the agent's prompt).
-      #
-      # Patterns are fnmatch-style and match the full
-      # `<type>/<field>` tag (so you can warn on a query if you
-      # want, e.g. `query/__schema` for introspection probing).
-      - mutation/mergePullRequest
-      - mutation/createCommitOnBranch
-      # Add more if you broaden `mutations:` above. Common candidates:
-      # - mutation/deleteRepository
-      # - mutation/transferRepository
-      # - mutation/archiveRepository
-      # - mutation/unarchiveRepository
-      # - mutation/deleteRef               # branch/tag deletion
-      # - mutation/createBranchProtectionRule
-      # - mutation/deleteBranchProtectionRule
-      # - mutation/addEnterpriseAdmin
-# repos:
-#   - full_name: your-org/your-repo
-#     pull_requests: ["*"]    # reserved for v2 (per-PR write scoping)
-#     issues:        ["*"]    # reserved for v2
-#     branches:      ["*"]    # reserved for v3 (git push REST scoping)
-#
-# TODO(policy-language): the per-repo fields above are placeholders
-# for a richer policy language. We want to express things like:
-#   - operations: [addComment, createPullRequest]   # per-repo op subset
-#   - issue_authors: [@me]                          # only act on issues you opened
-#   - pull_request_authors: [@me]
-#   - branches_matching: ["agent/*", "!main"]
-#   - dangerous_overrides: [...]                    # per-repo watchlist
-# The scope check already decodes per-object DB IDs from node IDs,
-# so the enforcement substrate is in place. See matching markers in
-# ``cli.py``, ``proxy/graphql_scope.py``, and ``docs/design.md``.
+# GitHub-specific access policy (GraphQL operation allowlist,
+# per-repo scope) is no longer carried here -- it lives in
+# `github_policy.yaml` next to this file. A user-supplied
+# `--allowlist` YAML may still include a top-level `github:` block
+# to override the bundled defaults for that session.
