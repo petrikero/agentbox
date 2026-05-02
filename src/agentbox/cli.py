@@ -221,12 +221,53 @@ def _main(argv: list[str] | None) -> None:
 
     ca_path = _ensure_mitmproxy_ca()
 
+    # Resolve --mock-llm / --mock-llm-transcript before starting the
+    # proxy. The resolved paths are absolute on the host: in permissive
+    # mode the proxy runs as a host subprocess so it reads them directly;
+    # in transparent-shared mode the script is staged into workdir and
+    # the sidecar reads it from /agentbox/proxy/mock_llm.py (transcript
+    # writing is unsupported in sidecar mode -- the sidecar's workdir
+    # bind-mount is read-only).
+    mock_llm_host_path: str | None = None
+    mock_transcript_host_path: str | None = None
+    if args.mock_llm is not None:
+        resolved = Path(args.mock_llm).expanduser().resolve()
+        if not resolved.is_file():
+            sys.exit(f"agentbox: --mock-llm script not found: {resolved}")
+        if network_mode == "transparent-shared":
+            staged = workdir / "mock_llm.py"
+            shutil.copy(resolved, staged)
+            staged.chmod(0o644)
+            mock_llm_host_path = str(staged)
+            _step("mock-llm", _short(resolved))
+        else:
+            mock_llm_host_path = str(resolved)
+            _step("mock-llm", _short(resolved))
+    if args.mock_llm_transcript is not None:
+        if network_mode != "permissive":
+            sys.exit(
+                "agentbox: --mock-llm-transcript is supported only with "
+                "--network permissive (the sidecar's workdir mount is "
+                "read-only). Drop the flag or switch network modes."
+            )
+        if args.mock_llm is None:
+            sys.exit(
+                "agentbox: --mock-llm-transcript requires --mock-llm"
+            )
+        mock_transcript_host_path = str(
+            Path(args.mock_llm_transcript).expanduser().resolve()
+        )
+
     sidecar_name: str | None = None
     port: int = 0
     if network_mode == "permissive":
         port = _find_free_port()
         t0 = time.monotonic()
-        proxy = _start_proxy(workdir, port)
+        proxy = _start_proxy(
+            workdir, port,
+            mock_llm=mock_llm_host_path,
+            mock_transcript=mock_transcript_host_path,
+        )
         atexit.register(lambda: _terminate(proxy))
         if not _wait_for_port(port, timeout=15):
             cleanup_workdir[0] = False  # keep proxy.log around for the user
@@ -342,6 +383,27 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "the agent, no env var needed. transparent-isolated: reserved "
             "for a Linux-only macvlan/CNI implementation; not yet "
             "supported."
+        ),
+    )
+    parser.add_argument(
+        "--mock-llm", default=None, metavar="PATH",
+        help=(
+            "Path to a Python module that scripts mock LLM responses. "
+            "When set, the proxy short-circuits requests to known LLM "
+            "hosts (api.anthropic.com, api.openai.com, api.z.ai) with "
+            "replies from this script instead of forwarding upstream. "
+            "Test/CI affordance: lets the real `pi` / `claude` binaries "
+            "run e2e in the sandbox without any network or API key. "
+            "See proxy/mock_llm.py for the script API."
+        ),
+    )
+    parser.add_argument(
+        "--mock-llm-transcript", default=None, metavar="PATH",
+        help=(
+            "Append a JSONL transcript of every intercepted LLM "
+            "request/response to this path. Only meaningful with "
+            "--mock-llm. Useful for asserting on what the agent asked "
+            "the model in e2e tests. Permissive network mode only."
         ),
     )
     parser.add_argument(
@@ -645,15 +707,27 @@ def _ensure_mitmproxy_ca() -> Path:
     return cert_path
 
 
-def _start_proxy(workdir: Path, port: int) -> subprocess.Popen:
+def _start_proxy(
+    workdir: Path,
+    port: int,
+    *,
+    mock_llm: str | None = None,
+    mock_transcript: str | None = None,
+) -> subprocess.Popen:
     log = (workdir / "proxy.log").open("a", encoding="utf-8")
+    cmd = [
+        sys.executable, "-m", "agentbox.proxy",
+        "--port", str(port),
+        "--credentials", str(workdir / "credentials.json"),
+        "--allowlist", str(workdir / "allowlist.yaml"),
+        "--repos", str(workdir / "repos.json"),
+    ]
+    if mock_llm:
+        cmd += ["--mock-llm", mock_llm]
+    if mock_transcript:
+        cmd += ["--mock-llm-transcript", mock_transcript]
     return subprocess.Popen(
-        [sys.executable, "-m", "agentbox.proxy",
-         "--port", str(port),
-         "--credentials", str(workdir / "credentials.json"),
-         "--allowlist", str(workdir / "allowlist.yaml"),
-         "--repos", str(workdir / "repos.json")],
-        stdout=log, stderr=subprocess.STDOUT,
+        cmd, stdout=log, stderr=subprocess.STDOUT,
     )
 
 

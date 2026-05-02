@@ -44,9 +44,33 @@ def main() -> None:
              "in transparent mode) and uses --mode transparent so the "
              "original destination is recovered via SO_ORIGINAL_DST.",
     )
+    parser.add_argument(
+        "--mock-llm", default="", metavar="PATH",
+        help="Path to a Python module that scripts mock LLM responses. "
+             "When set, requests to api.anthropic.com / api.openai.com / "
+             "api.z.ai are short-circuited with replies from this script "
+             "instead of being forwarded upstream. Test affordance; "
+             "leave empty for normal operation.",
+    )
+    parser.add_argument(
+        "--mock-llm-transcript", default="", metavar="PATH",
+        help="Path to append a JSONL transcript of intercepted LLM "
+             "requests / responses. Only meaningful with --mock-llm.",
+    )
     args = parser.parse_args()
 
     filter_path = Path(__file__).parent / "filter.py"
+
+    extra_set: list[str] = []
+    if args.mock_llm:
+        extra_set += [
+            "--set", f"agentbox_mock_llm_script={args.mock_llm}",
+        ]
+    if args.mock_llm_transcript:
+        extra_set += [
+            "--set",
+            f"agentbox_mock_llm_transcript={args.mock_llm_transcript}",
+        ]
 
     if args.transparent:
         sys.argv = [
@@ -61,6 +85,7 @@ def main() -> None:
             "--set", f"agentbox_credentials={args.credentials}",
             "--set", f"agentbox_allowlist={args.allowlist}",
             "--set", f"agentbox_repos={args.repos}",
+            *extra_set,
         ]
     else:
         sys.argv = [
@@ -71,6 +96,7 @@ def main() -> None:
             "--set", f"agentbox_credentials={args.credentials}",
             "--set", f"agentbox_allowlist={args.allowlist}",
             "--set", f"agentbox_repos={args.repos}",
+            *extra_set,
         ]
     mitmdump()
 

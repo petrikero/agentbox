@@ -55,6 +55,7 @@ from agentbox.proxy.graphql_operations import (
 )
 from agentbox.proxy.graphql_scope import ScopeVerdict, check_repo_scope
 from agentbox.proxy.handlers import GithubCredentialHandler
+from agentbox.proxy.mock_llm import MockLLM
 
 
 _GRAPHQL_HOST = "api.github.com"
@@ -153,6 +154,13 @@ class AgentboxFilter:
             )
 
     def request(self, flow: http.HTTPFlow) -> None:
+        # If an earlier addon (e.g. MockLLM) already produced a response,
+        # don't run the allowlist / credential swap on top of it -- a
+        # blocked-host verdict here would clobber the mock's reply.
+        # ``getattr`` keeps the duck-typed test flows (which don't set
+        # ``response`` at all) flowing through the existing assertions.
+        if getattr(flow, "response", None) is not None:
+            return
         if not self._request_allowed(flow.request):
             ctx.log.warn(
                 f"agentbox: BLOCKED {flow.request.method} {flow.request.pretty_url}"
@@ -342,4 +350,7 @@ def _graphql_403(error: str, message: str, detail: str) -> http.Response:
     )
 
 
-addons = [AgentboxFilter()]
+# MockLLM goes first so its `request()` hook runs before AgentboxFilter
+# would see the request. When `agentbox_mock_llm_script` is empty the
+# addon is inert and AgentboxFilter handles every request as before.
+addons = [MockLLM(), AgentboxFilter()]

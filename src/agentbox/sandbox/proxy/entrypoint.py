@@ -215,15 +215,21 @@ def main() -> None:
         stdout=sys.stdout, stderr=sys.stderr,
     )
 
+    # Optional: e2e-test mock-llm script staged by the launcher into
+    # the bind-mounted workdir. Inert when absent (production path).
+    mock_llm_script = _WORKDIR / "mock_llm.py"
+    proxy_cmd = [
+        sys.executable, "-m", "agentbox.proxy",
+        "--transparent",
+        "--port", str(_PROXY_PORT),
+        "--credentials", str(creds),
+        "--allowlist", str(allowlist),
+        "--repos", str(repos),
+    ]
+    if mock_llm_script.is_file():
+        proxy_cmd += ["--mock-llm", str(mock_llm_script)]
     proxy_proc = subprocess.Popen(
-        [
-            sys.executable, "-m", "agentbox.proxy",
-            "--transparent",
-            "--port", str(_PROXY_PORT),
-            "--credentials", str(creds),
-            "--allowlist", str(allowlist),
-            "--repos", str(repos),
-        ],
+        proxy_cmd,
         stdout=sys.stdout, stderr=sys.stderr,
     )
 
