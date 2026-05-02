@@ -1100,6 +1100,54 @@ def _write_claude_managed_settings(path: Path) -> None:
     )
 
 
+def _ensure_claude_workspace_trusted(
+    claude_json: Path, container_cwd: str,
+) -> None:
+    """Mark the container's cwd as trusted in the host's ``~/.claude.json``.
+
+    Claude Code shows a "Is this a project you trust?" dialog the first
+    time it sees a workspace path, recording acceptance under
+    ``projects.<cwd>.hasTrustDialogAccepted`` in ``~/.claude.json``. The
+    key is per-project state -- there is no managed-settings or env-var
+    bypass, and the dialog deliberately runs before repo-controlled
+    settings load (security advisory ``GHSA-mmgp-wc2j-qcv7``).
+
+    The container cwd mirrors the host cwd under ``/agentbox/...`` (see
+    ``_host_to_container_path``), so each project gets its own trust
+    entry. Entries are inert outside the container -- no host project
+    has cwd ``/agentbox/<host-path>``.
+
+    Writes are atomic and skipped when the value is already set, so
+    this is a no-op on subsequent launches of the same project. If the
+    file doesn't exist, it's created with just this entry; the
+    bind-mount in ``_run_agent`` is conditional on the file existing,
+    so creating it here is also what makes the mount happen on the
+    very first run.
+    """
+    try:
+        data = json.loads(claude_json.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            data = {}
+    except (FileNotFoundError, json.JSONDecodeError):
+        data = {}
+
+    projects = data.setdefault("projects", {})
+    if not isinstance(projects, dict):
+        projects = {}
+        data["projects"] = projects
+    entry = projects.setdefault(container_cwd, {})
+    if not isinstance(entry, dict):
+        entry = {}
+        projects[container_cwd] = entry
+    if entry.get("hasTrustDialogAccepted") is True:
+        return
+
+    entry["hasTrustDialogAccepted"] = True
+    tmp = claude_json.with_suffix(claude_json.suffix + ".agentbox-tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    os.replace(tmp, claude_json)
+
+
 _CONTAINER_MOUNT_ROOT = "/agentbox"
 
 
@@ -1272,14 +1320,19 @@ def _run_agent(
             )
         cmd += ["--network", f"container:{sidecar_name}"]
 
-    if mode == "claude" and claude_dir.exists():
-        cmd += ["-v", f"{claude_dir.as_posix()}:/home/agentbox/.claude"]
-    if mode == "claude" and claude_json.exists():
-        # Claude Code stores credentials/login state in ~/.claude.json,
-        # not under ~/.claude/. Without this mount the container's claude
-        # is logged out and falls back to OAuth via platform.claude.com.
-        cmd += ["-v", f"{claude_json.as_posix()}:/home/agentbox/.claude.json"]
     if mode == "claude":
+        # Mark the container's cwd as already-trusted so claude doesn't
+        # show the "Is this a project you trust?" prompt on first run.
+        # Writes (or creates) the host's ~/.claude.json; the entry is
+        # inert outside the container.
+        _ensure_claude_workspace_trusted(claude_json, container_cwd)
+        if claude_dir.exists():
+            cmd += ["-v", f"{claude_dir.as_posix()}:/home/agentbox/.claude"]
+        if claude_json.exists():
+            # Claude Code stores credentials/login state in ~/.claude.json,
+            # not under ~/.claude/. Without this mount the container's claude
+            # is logged out and falls back to OAuth via platform.claude.com.
+            cmd += ["-v", f"{claude_json.as_posix()}:/home/agentbox/.claude.json"]
         # Put claude into auto permission mode (auto-approve with a
         # model-side safety check) via a managed settings file. Lives
         # at a system path that's independent of ~/.claude/, so the
