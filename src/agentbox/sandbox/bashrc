@@ -72,7 +72,7 @@ if [ "${SHLVL}" = "1" ] && [ -z "${AGENTBOX_BANNER_SHOWN}" ]; then
     printf '\n'
     printf '  \e[1;35magentbox sandbox\e[0m  --  agent-isolation container with credential proxy\n\n'
     printf '  workspace:  %s    (host cwd)\n' "${PWD}"
-    printf '  agent dirs: /home/agentbox/.pi      (always)\n'
+    printf '  agent dirs: /home/agentbox/.pi      (if mounted)\n'
     printf '              /home/agentbox/.claude  (if mounted)\n'
     printf '  network:    HTTPS via %s\n' "${HTTPS_PROXY:-(none)}"
     printf '              allowlist enforced; CONNECT, raw TCP, DNS exfil all blocked\n'

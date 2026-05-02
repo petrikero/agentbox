@@ -16,9 +16,11 @@ The launcher:
    node_id}``), and a copy of the resolved allowlist to a tempdir.
 4. Ensures mitmproxy's CA cert exists, generating it if needed.
 5. Starts ``python -m agentbox.proxy`` as a subprocess on a free local port.
-6. Runs ``docker run`` with the chosen mode's entrypoint, mounting the cwd,
-   ``~/.pi``, ``~/.claude`` and ``~/.claude.json`` (if present), and the proxy CA, and setting
-   ``HTTPS_PROXY`` plus per-tool CA env vars.
+6. Runs ``docker run`` with the chosen mode's entrypoint, mounting the cwd
+   and the proxy CA, plus the minimal credentials the chosen mode needs
+   (``~/.pi`` for pi mode; ``~/.claude`` and ``~/.claude.json`` for claude
+   mode, when present; nothing extra for shell), and setting ``HTTPS_PROXY``
+   plus per-tool CA env vars.
 7. For ``pi -p`` (with session persistence on), spawns a background thread
    that tails the new session JSONL pi writes under ``~/.pi/agent/sessions/``
    and renders tool calls / results inline on stderr via
@@ -79,7 +81,7 @@ def _step(label: str, value: str = "", *, level: str = "ok") -> None:
     bullet = "!" if level == "warn" else "·"
     _console.print(
         f" [{bullet_style} dim]{bullet}[/] "
-        f"[dim]{label:<10}[/]  {value}"
+        f"[dim]{label:<11}[/]  {value}"
     )
 
 
@@ -1113,7 +1115,8 @@ def _run_agent(
     container_cwd = container_workdir or _host_to_container_path(cwd)
     home = Path.home()
     pi_dir = home / ".pi"
-    pi_dir.mkdir(exist_ok=True)
+    if mode == "pi":
+        pi_dir.mkdir(exist_ok=True)
     claude_dir = home / ".claude"
     claude_json = home / ".claude.json"
 
@@ -1162,7 +1165,6 @@ def _run_agent(
     cmd += [
         "-v", f"{cwd.as_posix()}:{container_cwd}",
         "-w", container_cwd,
-        "-v", f"{pi_dir.as_posix()}:/home/agentbox/.pi",
         "-v", f"{Path(ca_path).as_posix()}:{container_ca}:ro",
         "-e", f"NODE_EXTRA_CA_CERTS={container_ca}",
         "-e", f"GIT_SSL_CAINFO={container_ca}",
@@ -1170,6 +1172,8 @@ def _run_agent(
         "-e", f"REQUESTS_CA_BUNDLE={container_ca}",
         "-e", f"CURL_CA_BUNDLE={container_ca}",
     ]
+    if mode == "pi":
+        cmd += ["-v", f"{pi_dir.as_posix()}:/home/agentbox/.pi"]
 
     if network_mode == "permissive":
         # HTTPS_PROXY-aware tools (gh, git, curl, npm, requests, the
@@ -1194,9 +1198,9 @@ def _run_agent(
             )
         cmd += ["--network", f"container:{sidecar_name}"]
 
-    if claude_dir.exists():
+    if mode == "claude" and claude_dir.exists():
         cmd += ["-v", f"{claude_dir.as_posix()}:/home/agentbox/.claude"]
-    if claude_json.exists():
+    if mode == "claude" and claude_json.exists():
         # Claude Code stores credentials/login state in ~/.claude.json,
         # not under ~/.claude/. Without this mount the container's claude
         # is logged out and falls back to OAuth via platform.claude.com.
@@ -1230,13 +1234,14 @@ def _run_agent(
         # we render in the live view.
         cmd.extend(["--output-format", "stream-json", "--verbose"])
 
-    mounts = [
-        f"{_short(cwd)} → {container_cwd}",
-        "~/.pi",
-        "~/.claude" if claude_dir.exists() else None,
-        "~/.claude.json" if claude_json.exists() else None,
-    ]
-    _step("mounts", ", ".join(m for m in mounts if m))
+    _step("workdir", f"{_short(cwd)} → {container_cwd}")
+    credentials = [c for c in (
+        "~/.pi" if mode == "pi" else None,
+        "~/.claude" if mode == "claude" and claude_dir.exists() else None,
+        "~/.claude.json" if mode == "claude" and claude_json.exists() else None,
+    ) if c]
+    if credentials:
+        _step("credentials", ", ".join(credentials))
     launch_cmd = shlex.join([cfg["entrypoint"], *cfg["default_args"], *mode_args])
     _console.print()
     _console.print(f"[bold cyan]$[/] {launch_cmd}")
