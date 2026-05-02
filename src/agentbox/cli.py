@@ -180,7 +180,6 @@ def _main(argv: list[str] | None) -> None:
     _header(f"agentbox · {args.mode}")
     if config_path is not None:
         _step("config", _short(config_path))
-    _step("network", _network_mode_summary(network_mode))
     image_tag = _ensure_image(
         no_cache=args.no_cache, cwd=Path.cwd(), network_mode=network_mode,
     )
@@ -208,6 +207,7 @@ def _main(argv: list[str] | None) -> None:
     allowlist_summary = _copy_allowlist(
         workdir / "allowlist.yaml", source=args.allowlist,
     )
+    _step("network", _network_mode_summary(network_mode))
     _step("allowlist", allowlist_summary)
 
     resolved_repos = _resolve_repos(args.repo, real_token)
@@ -816,15 +816,16 @@ def _ensure_image(no_cache: bool, cwd: Path, network_mode: str) -> str:
         sys.exit(
             f"agentbox: failed to build {BASE_IMAGE_TAG} (exit {rc})"
         )
-    _step(
-        "base",
-        f"{BASE_IMAGE_TAG} [dim](built in {time.monotonic() - t0:.1f}s)[/]",
-    )
+    base_secs = time.monotonic() - t0
 
     # Tier 2: project image (only if Dockerfile.agentbox exists in cwd).
     project_dockerfile = cwd / PROJECT_DOCKERFILE_NAME
     if not project_dockerfile.is_file():
-        _step("image", f"{BASE_IMAGE_TAG} [dim](no {PROJECT_DOCKERFILE_NAME})[/]")
+        _step(
+            "image",
+            f"{BASE_IMAGE_TAG} [dim](base built in {base_secs:.1f}s, "
+            f"no {PROJECT_DOCKERFILE_NAME})[/]",
+        )
         return BASE_IMAGE_TAG
 
     project_tag = f"{PROJECT_IMAGE_PREFIX}:{_safe_image_tag(cwd.name)}"
@@ -852,7 +853,7 @@ def _ensure_image(no_cache: bool, cwd: Path, network_mode: str) -> str:
     _step(
         "image",
         f"{project_tag} [dim](built in {time.monotonic() - t0:.1f}s, "
-        f"FROM {BASE_IMAGE_TAG})[/]",
+        f"FROM {BASE_IMAGE_TAG} built in {base_secs:.1f}s)[/]",
     )
     return project_tag
 
