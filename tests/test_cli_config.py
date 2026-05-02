@@ -36,10 +36,12 @@ def _ns(
     repo: list[str] | None = None,
     config: str | None = None,
     network: str | None = None,
+    workdir: str | None = None,
 ) -> argparse.Namespace:
     """Minimal argparse Namespace with the fields the loader reads."""
     return argparse.Namespace(
         repo=list(repo or []), config=config, network=network,
+        workdir=workdir,
     )
 
 
@@ -232,6 +234,35 @@ class MergeConfigFileTests(unittest.TestCase):
         ns = _ns()
         _merge_config_file(ns)
         self.assertEqual(ns.network, "transparent-isolated")
+
+    # ------------------------------------------------------------------
+    # Container workdir override (workdir:) key
+    # ------------------------------------------------------------------
+
+    def test_workdir_absent_leaves_args_workdir_none(self) -> None:
+        self._write_config("github:\n  repos: [a/b]\n")
+        ns = _ns()
+        _merge_config_file(ns)
+        self.assertIsNone(ns.workdir)
+
+    def test_workdir_from_config_loads_when_cli_absent(self) -> None:
+        self._write_config("workdir: /app\n")
+        ns = _ns()
+        _merge_config_file(ns)
+        self.assertEqual(ns.workdir, "/app")
+
+    def test_workdir_cli_overrides_config(self) -> None:
+        self._write_config("workdir: /from-config\n")
+        ns = _ns(workdir="/from-cli")
+        _merge_config_file(ns)
+        self.assertEqual(ns.workdir, "/from-cli")
+
+    def test_workdir_non_string_errors(self) -> None:
+        self._write_config("workdir:\n  - a\n  - b\n")
+        ns = _ns()
+        with self.assertRaises(SystemExit) as cm:
+            _merge_config_file(ns)
+        self.assertIn("'workdir:' must be a string", str(cm.exception))
 
 
 if __name__ == "__main__":

@@ -146,6 +146,15 @@ def _main(argv: list[str] | None) -> None:
     args = _parse_args(argv)
     config_path = _merge_config_file(args)
 
+    # Container workdir override: CLI > config > None. When None, the
+    # default in _run_agent kicks in (mirror the host cwd under
+    # /agentbox/). Validated up-front -- including under doctor mode
+    # -- so a typo surfaces immediately rather than at docker-run time.
+    workdir_override: str | None = getattr(args, "workdir", None)
+    if workdir_override is not None:
+        workdir_override = _validate_container_workdir(workdir_override)
+        args.workdir = workdir_override  # store normalized value
+
     # Resolve network mode: CLI flag > config file > default. Default
     # stays permissive so today's local-dev flow keeps working unchanged.
     network_mode = getattr(args, "network", None) or DEFAULT_NETWORK_MODE
@@ -241,6 +250,7 @@ def _main(argv: list[str] | None) -> None:
     rc = _run_agent(
         args.mode, port, surrogate, real_token, ca_path,
         args.mode_args, image_tag=image_tag, workdir=workdir,
+        container_workdir=workdir_override,
         network_mode=network_mode, sidecar_name=sidecar_name,
     )
 
@@ -305,6 +315,18 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
             "and silently runs without it if absent. Pass an explicit "
             "path to require the file (the launcher exits if it's "
             "missing or malformed)."
+        ),
+    )
+    parser.add_argument(
+        "--workdir", default=None, metavar="PATH",
+        help=(
+            "Override the container-side workdir (an absolute POSIX "
+            "path). By default the host cwd is mirrored under "
+            "`/agentbox/` (e.g. C:\\code\\foo -> /agentbox/c/code/foo); "
+            "pass --workdir /app to mount it at /app instead. Useful "
+            "when project tooling embeds container paths into build "
+            "artifacts and you want them stable across hosts. CLI "
+            "wins over the config file's `workdir:` key."
         ),
     )
     parser.add_argument(
@@ -393,11 +415,13 @@ def _merge_config_file(args: argparse.Namespace) -> Path | None:
       a missing file is a silent no-op (the common case for users
       who haven't set one up yet).
 
-    Today only ``github.repos`` is read, and it's *additive* over
-    ``--repo`` CLI flags (file entries first, CLI appended). Other
-    top-level keys are silently kept aside for future schema growth
-    -- a typo in an unknown section won't surface as an error here,
-    by design, so configs from a newer agentbox load on an older one.
+    Today ``github.repos``, ``network``, and ``workdir`` are read.
+    ``github.repos`` is *additive* over ``--repo`` CLI flags (file
+    entries first, CLI appended); ``network`` and ``workdir`` only
+    apply when the matching CLI flag wasn't given. Other top-level
+    keys are silently kept aside for future schema growth -- a typo
+    in an unknown section won't surface as an error here, by design,
+    so configs from a newer agentbox load on an older one.
 
     TODO(policy-language): ``repos:`` is a flat list of full-names
     today. We need a richer per-repo policy object that can express
@@ -467,6 +491,18 @@ def _merge_config_file(args: argparse.Namespace) -> Path | None:
             )
         if getattr(args, "network", None) is None:
             args.network = config_network
+
+    # Container workdir override: a user-supplied absolute POSIX path
+    # the launcher mounts the host cwd at instead of the default
+    # /agentbox/<mirrored-host-path>. Validated at use-time in _main
+    # so both the file value and any CLI value run through the same
+    # check. CLI flag wins over file when both are set.
+    if "workdir" in data:
+        config_workdir = data.get("workdir")
+        if config_workdir is not None and not isinstance(config_workdir, str):
+            sys.exit(f"agentbox: {path}: 'workdir:' must be a string")
+        if config_workdir and getattr(args, "workdir", None) is None:
+            args.workdir = config_workdir
     return path
 
 
@@ -1017,6 +1053,47 @@ def _host_to_container_path(host_path: Path) -> str:
     return f"{_CONTAINER_MOUNT_ROOT}/{suffix}"
 
 
+# Container paths agentbox already bind-mounts; an override that lands
+# on or under any of these would either be hidden or overwrite our own
+# state, so refuse it up front.
+_RESERVED_CONTAINER_PATHS = (
+    "/home/agentbox",
+    "/etc/claude-code",
+    "/usr/local/share/ca-certificates",
+)
+
+
+def _validate_container_workdir(raw: str) -> str:
+    """Validate a user-supplied container workdir override.
+
+    Returns the normalized value (no trailing slash). Exits with a
+    helpful message on any of: not a string, not absolute, root,
+    or landing under a path agentbox already mounts internally.
+    """
+    if not isinstance(raw, str) or not raw:
+        sys.exit(
+            "agentbox: container workdir override must be a non-empty string"
+        )
+    if not raw.startswith("/"):
+        sys.exit(
+            f"agentbox: container workdir override must be an absolute "
+            f"POSIX path (start with '/'), got {raw!r}"
+        )
+    normalized = raw.rstrip("/") or "/"
+    if normalized == "/":
+        sys.exit(
+            "agentbox: container workdir override cannot be '/' "
+            "(would shadow the entire container filesystem)"
+        )
+    for reserved in _RESERVED_CONTAINER_PATHS:
+        if normalized == reserved or normalized.startswith(reserved + "/"):
+            sys.exit(
+                f"agentbox: container workdir {normalized!r} would "
+                f"conflict with the internal mount under {reserved!r}"
+            )
+    return normalized
+
+
 def _run_agent(
     mode: str,
     port: int,
@@ -1027,12 +1104,13 @@ def _run_agent(
     *,
     image_tag: str,
     workdir: Path,
+    container_workdir: str | None = None,
     network_mode: str = DEFAULT_NETWORK_MODE,
     sidecar_name: str | None = None,
 ) -> int:
     cfg = MODES[mode]
     cwd = Path.cwd().resolve()
-    container_cwd = _host_to_container_path(cwd)
+    container_cwd = container_workdir or _host_to_container_path(cwd)
     home = Path.home()
     pi_dir = home / ".pi"
     pi_dir.mkdir(exist_ok=True)
