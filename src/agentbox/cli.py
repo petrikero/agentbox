@@ -66,6 +66,7 @@ from agentbox._shared import (
     PROJECT_IMAGE_PREFIX,
     PROXY_SIDECAR_IMAGE_TAG,
     _DOCKER_ENV,
+    _detect_cwd_github_repo,
     _resolve_real_token,
     _safe_image_tag,
 )
@@ -95,9 +96,15 @@ def _short(p: Path | str) -> str:
 
 
 def _github_mode_summary(
-    mode: str, repos: list[dict], gh_user: str,
+    mode: str, repos: list[dict], gh_user: str, auto_detected: str | None,
 ) -> str:
-    """One-line description of the resolved GitHub mode for the banner."""
+    """One-line description of the resolved GitHub mode for the banner.
+
+    ``auto_detected`` is the ``owner/name`` injected by
+    ``_maybe_inject_cwd_repo``, or ``None``. When set, the summary
+    annotates the line so the operator can tell the cwd's origin
+    drove the scope (vs an explicit ``--repo`` / config entry).
+    """
     if mode == "none":
         return "none  [dim](public reads only — no token resolved)[/]"
     if mode == "unrestricted":
@@ -113,8 +120,15 @@ def _github_mode_summary(
             )
         names = ", ".join(r["full_name"] for r in repos)
         n = len(repos)
+        suffix = (
+            "; auto-detected from cwd"
+            if auto_detected and len(repos) == 1
+            and repos[0]["full_name"] == auto_detected
+            else ""
+        )
         return (
-            f"scoped  [dim]({n} repo{'s' if n != 1 else ''}: {names})[/]"
+            f"scoped  [dim]({n} repo{'s' if n != 1 else ''}: "
+            f"{names}{suffix})[/]"
         )
     return mode
 
@@ -241,14 +255,18 @@ def _main(argv: list[str] | None) -> None:
     _step("network", _network_mode_summary(network_mode))
     _step("allowlist", allowlist_summary)
 
+    auto_detected = _maybe_inject_cwd_repo(args, real_token)
     resolved_repos = _resolve_repos(args.repo, real_token)
     github_mode = _resolve_github_mode(
-        getattr(args, "github_mode", None), real_token, resolved_repos,
+        getattr(args, "github_mode", None), real_token,
     )
     args.github_mode = github_mode  # so doctor and downstream see resolved value
     _write_github_policy(workdir / "github.json", github_mode, resolved_repos)
     _step(
-        "github", _github_mode_summary(github_mode, resolved_repos, gh_user),
+        "github",
+        _github_mode_summary(
+            github_mode, resolved_repos, gh_user, auto_detected,
+        ),
     )
 
     ca_path = _ensure_mitmproxy_ca()
@@ -801,30 +819,65 @@ def _resolve_repos(
 
 
 def _resolve_github_mode(
-    explicit: str | None, real_token: str, repos: list[dict],
+    explicit: str | None, real_token: str,
 ) -> str:
-    """Map (explicit mode, token presence, repos) onto a concrete mode.
+    """Map (explicit mode, token presence) onto a concrete mode.
 
     Explicit ``none``/``unrestricted``/``scoped`` always wins.
     ``auto`` (or unset) resolves per the table:
 
-    +--------------+-------------+----------------+
-    | token        | repos       | resolved mode  |
-    +==============+=============+================+
-    | absent       | (any)       | ``none``       |
-    | present      | empty       | ``unrestricted`` |
-    | present      | non-empty   | ``scoped``     |
-    +--------------+-------------+----------------+
+    +--------------+----------------+
+    | token        | resolved mode  |
+    +==============+================+
+    | absent       | ``none``       |
+    | present      | ``scoped``     |
+    +--------------+----------------+
 
-    ``mode: scoped`` with empty ``repos`` is valid -- it means
-    reads-everywhere, writes-nowhere, which is a useful safe
-    default once chunk 3's writes-only fence lands.
+    The auto default is **scoped** even when ``repos`` is empty:
+    "read everywhere, write nowhere" beats "write everywhere
+    your PAT can reach" as a safe default. The launcher tries
+    to pre-fill ``repos`` with the cwd's GitHub origin (see
+    ``_maybe_inject_cwd_repo``) so the common case -- agentbox
+    spawned inside a working tree -- gets writes to that one
+    repo. Pass ``--github-mode unrestricted`` (or set
+    ``github.mode: unrestricted`` in the config file) for the
+    old behaviour.
     """
     if explicit and explicit != "auto":
         return explicit
     if not real_token:
         return "none"
-    return "scoped" if repos else "unrestricted"
+    return "scoped"
+
+
+def _maybe_inject_cwd_repo(
+    args: argparse.Namespace, real_token: str,
+) -> str | None:
+    """Pre-fill ``args.repo`` from the cwd's GitHub origin in auto mode.
+
+    When the user hasn't specified an explicit mode (or chose
+    ``auto``) and hasn't listed any repos via ``--repo`` / config
+    yaml, we try to detect the cwd's GitHub origin and prepend it
+    as a string-shorthand entry. The result is the "default mode
+    is read/write the current repo, read-only the rest" behaviour
+    callers expect.
+
+    Returns the injected ``owner/name``, or ``None`` if no injection
+    was made (already explicit, repos already listed, no token, or
+    cwd has no recognised GitHub origin).
+    """
+    explicit = getattr(args, "github_mode", None)
+    if explicit and explicit != "auto":
+        return None
+    if args.repo:
+        return None
+    if not real_token:
+        return None
+    cwd_repo = _detect_cwd_github_repo()
+    if not cwd_repo:
+        return None
+    args.repo = [cwd_repo]
+    return cwd_repo
 
 
 def _write_github_policy(

@@ -37,6 +37,7 @@ from agentbox._shared import (
     PROJECT_IMAGE_PREFIX,
     PROXY_SIDECAR_IMAGE_TAG,
     _DOCKER_ENV,
+    _detect_cwd_github_repo,
     _resolve_real_token,
     _safe_image_tag,
 )
@@ -224,6 +225,7 @@ def _section_github(
     args: argparse.Namespace,
     repos: list[str | dict],
     real_token: str,
+    auto_detected: str | None,
 ) -> None:
     """Resolved GitHub access mode + per-repo policy."""
     rep.header("GitHub access")
@@ -235,16 +237,24 @@ def _section_github(
     )
 
     # Mirror cli._resolve_github_mode without importing (avoids a
-    # cli <- doctor cycle today).
+    # cli <- doctor cycle today). Auto + token resolves to scoped
+    # regardless of whether repos is empty -- safer than the old
+    # auto + token + empty -> unrestricted default.
     if explicit and explicit != "auto":
         resolved = explicit
     elif not real_token:
         resolved = "none"
-    elif repos:
-        resolved = "scoped"
     else:
-        resolved = "unrestricted"
+        resolved = "scoped"
     rep.ok("resolved mode", resolved)
+
+    if auto_detected:
+        rep.info(
+            "auto-detected",
+            f"{auto_detected} [dim](cwd's GitHub origin -- pre-filled "
+            f"because no explicit --repo / config repos and mode is "
+            f"auto)[/]",
+        )
 
     if not repos:
         rep.info(
@@ -742,9 +752,24 @@ def run(args: argparse.Namespace, config_path: Path | None) -> int:
     real_token, token_source = _resolve_real_token()
     repos = _combined_repos(args)
 
+    # Mirror the launcher's auto-injection so the doctor report
+    # describes the same repos the launcher would resolve. We only
+    # inject under the same conditions cli._maybe_inject_cwd_repo
+    # uses: auto mode (or unset) + no explicit repos + a token.
+    auto_detected: str | None = None
+    explicit_mode = getattr(args, "github_mode", None)
+    if (
+        (not explicit_mode or explicit_mode == "auto")
+        and not repos
+        and real_token
+    ):
+        auto_detected = _detect_cwd_github_repo()
+        if auto_detected:
+            repos = [auto_detected]
+
     _section_config(rep, args, config_path)
     _section_credentials(rep, real_token, token_source)
-    _section_github(rep, args, repos, real_token)
+    _section_github(rep, args, repos, real_token, auto_detected)
     allowlist_data, _ = _section_allowlist(rep, args)
     _section_graphql_gate(rep, allowlist_data)
     _section_image(rep)

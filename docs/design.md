@@ -367,7 +367,9 @@ github:
         create: ["agent/*"]
 ```
 
-`mode: auto` resolves based on token presence and `repos:` content — no token → `none`, token + empty repos → `unrestricted`, token + non-empty repos → `scoped`. Explicit `mode:` always wins. The CLI mirror is `--github-mode {none,unrestricted,scoped,auto}`. The launcher resolves the merged config (CLI flags additive over yaml) into `workdir/github.json` (`{mode, repos: [{full_name, node_id, issues, pull_requests, branches}]}`) and hands that to the proxy via `--github-policy`. The curated GraphQL operation allowlist lives in a separate bundled file (`proxy/github_policy.yaml`), loaded by the proxy regardless of the network mode.
+`mode: auto` resolves to `none` when no token is available and `scoped` when a token is present. In auto mode, if no explicit repos are listed (neither `--repo` nor `github.repos:` in the config), the launcher detects the cwd's GitHub origin via `git remote get-url origin` and pre-fills it as the single allowed repo. The result is the natural default: **read/write the current repo, read-only on every other repo the PAT can see** (the writes-only fence is enforced once chunk-3 enforcement lands). When the cwd has no recognised GitHub origin, scoped mode runs with empty repos — read everywhere, write nowhere.
+
+Explicit `mode:` always wins. Pass `--github-mode unrestricted` (or set it in the config) for the old "trust the PAT, no per-repo fence" behaviour. The launcher resolves the merged config (CLI flags additive over yaml) into `workdir/github.json` (`{mode, repos: [{full_name, node_id, issues, pull_requests, branches}]}`) and hands that to the proxy via `--github-policy`. The curated GraphQL operation allowlist lives in a separate bundled file (`proxy/github_policy.yaml`), loaded by the proxy regardless of the network mode.
 
 ## Current limitations and follow-ups
 

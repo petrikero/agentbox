@@ -130,3 +130,74 @@ def _resolve_real_token() -> tuple[str, str]:
         return "", ""
     token = result.stdout.strip()
     return (token, "gh auth token") if token else ("", "")
+
+
+# GitHub remote URL forms we recognise:
+#
+#   https://github.com/owner/name(.git)?(/)?
+#   http://github.com/owner/name(.git)?(/)?      (rare but accepted)
+#   git@github.com:owner/name(.git)?(/)?         (scp-like SSH)
+#   ssh://git@github.com/owner/name(.git)?(/)?   (full SSH URL)
+#   ssh://git@github.com:22/owner/name(.git)?    (rare; non-standard port)
+#
+# We allow optional ``.git`` suffix and trailing slash. Anything else
+# (gitlab, bitbucket, custom host, fork enterprise) returns ``None``
+# so the caller falls back to "no auto-detected repo" rather than
+# producing a confusing partial match.
+import re as _re
+
+_GITHUB_REMOTE_RE = _re.compile(
+    r"""
+    ^                                                # anchor
+    (?:
+        https?://github\.com/                        # https?
+      | git@github\.com:                             # scp-like
+      | ssh://git@github\.com(?::\d+)?/              # ssh(:port)?
+    )
+    (?P<owner>[^/]+)                                 # owner segment
+    /
+    (?P<name>[^/]+?)                                 # repo segment (lazy)
+    (?:\.git)?                                       # optional .git suffix
+    /?                                               # optional trailing /
+    $
+    """,
+    _re.VERBOSE,
+)
+
+
+def _parse_github_remote_url(url: str) -> str | None:
+    """Return ``"owner/name"`` if ``url`` is a recognised GitHub remote.
+
+    Returns ``None`` on non-match (other host, malformed URL, empty
+    string). Extracted as a pure function so URL parsing has direct
+    unit tests independent of subprocess plumbing.
+    """
+    if not url:
+        return None
+    m = _GITHUB_REMOTE_RE.match(url.strip())
+    if not m:
+        return None
+    return f"{m.group('owner')}/{m.group('name')}"
+
+
+def _detect_cwd_github_repo() -> str | None:
+    """Return ``owner/name`` for the cwd's GitHub origin, or ``None``.
+
+    Tries ``git -C <cwd> remote get-url origin`` and parses common
+    GitHub URL forms. Soft-fails (returns ``None``) if the cwd is
+    not a git checkout, has no ``origin`` remote, the remote points
+    elsewhere (gitlab, custom server), or ``git`` is missing. The
+    caller treats ``None`` as "no auto-detected repo" -- which in
+    auto mode means the launcher falls back to a scoped fence with
+    no repos (reads everywhere, writes nowhere).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=3, check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_github_remote_url(result.stdout)
