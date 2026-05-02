@@ -64,8 +64,8 @@ class ScopeResult:
 
     ``detail`` carries the offending node ID / repo full-name (for
     OUT_OF_SCOPE) or a diagnostic label (``"<unparseable>"``,
-    ``"<too-large>"``, ``"<unresolved-variable>"``). ``None`` for
-    ALLOWED.
+    ``"<too-large>"``, ``"<too-deep>"``, ``"<unresolved-variable>"``).
+    ``None`` for ALLOWED.
     """
 
     verdict: ScopeVerdict
@@ -78,6 +78,7 @@ _UNRESOLVED = ScopeResult(
     ScopeVerdict.UNRESOLVED_VARIABLE, "<unresolved-variable>"
 )
 _TOO_LARGE = ScopeResult(ScopeVerdict.PARSE_ERROR, "<too-large>")
+_TOO_DEEP = ScopeResult(ScopeVerdict.PARSE_ERROR, "<too-deep>")
 
 _MAX_BODY_SIZE = 1024 * 1024
 
@@ -350,6 +351,11 @@ def check_repo_scope(
         body = json.loads(request_body)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return _PARSE_ERROR
+    except RecursionError:
+        # stdlib json.loads is recursive (one C frame per container);
+        # an attacker-controlled body nested past sys.getrecursionlimit()
+        # would crash the proxy. Fail-secure rather than try to parse it.
+        return _TOO_DEEP
 
     if not isinstance(body, dict):
         return _PARSE_ERROR

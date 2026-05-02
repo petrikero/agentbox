@@ -70,6 +70,10 @@ def _oos(detail: str) -> ScopeResult:
     return ScopeResult(ScopeVerdict.OUT_OF_SCOPE, detail)
 
 
+def _too_deep() -> ScopeResult:
+    return ScopeResult(ScopeVerdict.PARSE_ERROR, "<too-deep>")
+
+
 class Layer0RepositoryFieldTests(unittest.TestCase):
     """Coverage for the ``repository(owner, name)`` selection check."""
 
@@ -389,55 +393,76 @@ class FailSecureTests(unittest.TestCase):
 
 
 class DeeplyNestedVariablesTests(unittest.TestCase):
-    """The variable-scan helpers walk attacker-controlled JSON.
+    """Pathologically nested ``variables`` must not crash the proxy.
 
-    The walkers used to recurse through dicts/lists, which made a
-    deeply nested ``variables`` body a trivial way to blow Python's
-    ~1000-frame default recursion limit and 500 the proxy. After the
-    iterative-stack rewrite they should handle nesting bounded only
-    by the body-size cap.
+    The variable-scan walkers were rewritten from recursive to
+    iterative so a deeply nested body could not blow Python's
+    ~1000-frame default recursion limit. But ``check_repo_scope``
+    still calls ``json.loads`` on the raw body before the walkers
+    ever run, and stdlib ``json`` is itself recursive (one C frame
+    per container). Past ``sys.getrecursionlimit()`` the parser
+    raises ``RecursionError``, which used to escape and 500 the
+    proxy.
 
-    Each test builds a body that would have crashed the recursive
-    version (well past ``sys.getrecursionlimit()``) and asserts the
-    walker returns a verdict instead of raising.
+    The fix is fail-secure: catch ``RecursionError`` and return a
+    PARSE_ERROR / ``<too-deep>`` verdict so the gate 403s the
+    request. These tests pin that behaviour.
+
+    Bodies are constructed as raw JSON bytes (not via ``json.dumps``,
+    which is also recursive and would crash the test setup itself
+    well before reaching the code under test).
     """
 
     _DEPTH = 5000
 
     def test_deeply_nested_dict_does_not_recurse(self) -> None:
-        # Layer 1 walker: nest a benign dict 5000 levels deep with no
-        # repositoryId anywhere. Old recursive code hit RecursionError
-        # before reaching the bottom; iterative walker returns ALLOWED.
-        node: dict = {"x": 1}
-        for _ in range(self._DEPTH):
-            node = {"nested": node}
-        body = _body("query Q { viewer { login } }", variables=node)
-        self.assertEqual(check_repo_scope(body, ALLOWED_IDS), _allowed())
+        # Nest a benign dict 5000 levels deep with no repositoryId
+        # anywhere. json.loads RecursionErrors -> _too_deep().
+        body = (
+            b'{"query":"query Q { viewer { login } }","variables":'
+            + b'{"nested":' * self._DEPTH
+            + b'{"x":1}'
+            + b"}" * self._DEPTH
+            + b"}"
+        )
+        self.assertEqual(check_repo_scope(body, ALLOWED_IDS), _too_deep())
 
     def test_deeply_nested_list_does_not_recurse(self) -> None:
-        # Same shape but alternating list/dict nesting -- exercises
-        # the list-of-dict branch in every walker.
-        node: dict | list = {"x": 1}
+        # Same depth but alternating list/dict containers, so the
+        # parser hits both code paths on the way down.
+        opens: list[bytes] = []
+        closes: list[bytes] = []
         for i in range(self._DEPTH):
-            node = [node] if i % 2 else {"nested": node}
-        body = _body("query Q { viewer { login } }", variables={"v": node})
-        self.assertEqual(check_repo_scope(body, ALLOWED_IDS), _allowed())
+            if i % 2:
+                opens.append(b"[")
+                closes.append(b"]")
+            else:
+                opens.append(b'{"nested":')
+                closes.append(b"}")
+        body = (
+            b'{"query":"query Q { viewer { login } }","variables":{"v":'
+            + b"".join(opens)
+            + b'{"x":1}'
+            + b"".join(reversed(closes))
+            + b"}}"
+        )
+        self.assertEqual(check_repo_scope(body, ALLOWED_IDS), _too_deep())
 
-    def test_deeply_nested_dict_finds_oos_node_id(self) -> None:
-        # Layer 3 walker: hide an out-of-scope subjectId at the bottom
-        # of a 5000-deep dict. Iterative walker must still find it.
-        leaf: dict = {"subjectId": ISSUE_EVIL}
-        node: dict = leaf
-        for _ in range(self._DEPTH):
-            node = {"nested": node}
-        body = _body(
-            "mutation Q($input: AddCommentInput!) {"
-            " addComment(input: $input) { clientMutationId } }",
-            variables={"input": node},
+    def test_deeply_nested_dict_with_oos_payload_rejected(self) -> None:
+        # Even when the leaf hides an out-of-scope subjectId, the
+        # body is rejected at parse time -- the walker never runs,
+        # which is fine because PARSE_ERROR also fails the gate.
+        leaf = json.dumps({"subjectId": ISSUE_EVIL}).encode()
+        body = (
+            b'{"query":"mutation Q($input: AddCommentInput!) {'
+            b" addComment(input: $input) { clientMutationId } }\","
+            b'"variables":{"input":'
+            + b'{"nested":' * self._DEPTH
+            + leaf
+            + b"}" * self._DEPTH
+            + b"}}"
         )
-        self.assertEqual(
-            check_repo_scope(body, ALLOWED_IDS), _oos(ISSUE_EVIL),
-        )
+        self.assertEqual(check_repo_scope(body, ALLOWED_IDS), _too_deep())
 
 
 if __name__ == "__main__":
