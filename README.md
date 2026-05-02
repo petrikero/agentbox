@@ -42,7 +42,7 @@ Modes:
 | Mode     | Runs     | Notes                                                                 |
 |----------|----------|-----------------------------------------------------------------------|
 | `pi`     | `pi`     | Default mode.                                                         |
-| `claude` | `claude` | Runs Claude Code with bypass-permissions enabled.                     |
+| `claude` | `claude` | Runs Claude Code in `auto` permission mode.                           |
 | `shell`  | `bash`   | Opens an interactive shell in the sandbox.                            |
 | `doctor` | none     | Checks configuration and prerequisites without launching a container.  |
 

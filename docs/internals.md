@@ -28,7 +28,7 @@ The container runs as the `agentbox` user with dropped Linux capabilities and `n
 - `~/.claude` -> `/home/agentbox/.claude`
 - `~/.claude.json` -> `/home/agentbox/.claude.json`
 
-Claude Code runs with a managed settings file mounted at `/etc/claude-code/managed-settings.json` to enable bypass-permissions mode without editing the user's host settings.
+Claude Code runs with a managed settings file mounted at `/etc/claude-code/managed-settings.json` that sets `permissions.defaultMode` to `auto` (auto-approve with a model-side safety check). This is non-interactive and leaves the user's host settings untouched.
 
 ## Credential Proxy
 

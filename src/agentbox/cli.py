@@ -1080,21 +1080,21 @@ _CLAUDE_MANAGED_SETTINGS_PATH = "/etc/claude-code/managed-settings.json"
 
 
 def _write_claude_managed_settings(path: Path) -> None:
-    """Write a Claude Code managed-settings file that puts claude in bypass mode.
+    """Write a Claude Code managed-settings file that puts claude in auto mode.
 
-    Claude Code shows an interactive "Bypass Permissions — I accept"
-    prompt on every ``--dangerously-skip-permissions`` start, and there
-    is no key that suppresses that specific prompt. The way to skip it
-    is to *not* pass the flag and instead set the permission mode via
-    settings: ``permissions.defaultMode = "bypassPermissions"``. The
-    agentbox sandbox is the very container the warning tells you to
-    run in, so we set bypass mode container-wide via a managed (policy)
-    settings file at a system path -- separate from ``~/.claude/`` so
-    the host bind-mount of the user's own settings is untouched.
+    Claude has an ``auto`` permission mode that auto-approves tool calls
+    with a model-side safety check (vs. ``bypassPermissions``, which
+    skips checks entirely). The agentbox container provides physical
+    isolation, but the host cwd is bind-mounted in, so the agent has
+    write access to the user's source tree -- ``auto`` keeps a
+    semantic guardrail on top of that without requiring per-call
+    prompts. We set it via a managed (policy) settings file at a
+    system path, separate from ``~/.claude/``, so the host bind-mount
+    of the user's own settings is untouched.
     """
     path.write_text(
         json.dumps({
-            "permissions": {"defaultMode": "bypassPermissions"}
+            "permissions": {"defaultMode": "auto"}
         }),
         encoding="utf-8",
     )
@@ -1280,11 +1280,10 @@ def _run_agent(
         # is logged out and falls back to OAuth via platform.claude.com.
         cmd += ["-v", f"{claude_json.as_posix()}:/home/agentbox/.claude.json"]
     if mode == "claude":
-        # Put claude into bypass-permissions mode without the
-        # --dangerously-skip-permissions flag (which always triggers an
-        # interactive "I accept" prompt). Lives at a system path that's
-        # independent of ~/.claude/, so the host's user settings
-        # (mounted above) are untouched.
+        # Put claude into auto permission mode (auto-approve with a
+        # model-side safety check) via a managed settings file. Lives
+        # at a system path that's independent of ~/.claude/, so the
+        # host's user settings (mounted above) are untouched.
         managed = workdir / "claude-managed-settings.json"
         _write_claude_managed_settings(managed)
         cmd += [
