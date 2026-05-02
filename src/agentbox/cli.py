@@ -1101,6 +1101,61 @@ def _write_claude_managed_settings(path: Path) -> None:
     )
 
 
+def _resolve_git_identity() -> dict[str, str]:
+    """Return host git user.name / user.email, omitting unset keys.
+
+    Reads only the host's *global* gitconfig (``git config --global``).
+    Per-repo overrides in the user's cwd flow through naturally via
+    the cwd bind-mount; lifting them to the container's global level
+    would shadow the per-repo intent the user set on the host.
+    """
+    identity: dict[str, str] = {}
+    for key in ("user.name", "user.email"):
+        try:
+            result = subprocess.run(
+                ["git", "config", "--global", key],
+                capture_output=True, text=True, timeout=3, check=False,
+            )
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return identity
+        if result.returncode == 0:
+            value = result.stdout.strip()
+            if value:
+                identity[key] = value
+    return identity
+
+
+def _write_git_config(path: Path, identity: dict[str, str]) -> None:
+    """Write the per-session gitconfig mounted into the container.
+
+    Two pieces:
+
+    1. ``[safe] directory = *`` -- the bind-mounted host repo at the
+       container's cwd surfaces as root-owned (Docker Desktop's
+       UID-translation default), but the agent runs as the
+       unprivileged ``agentbox`` user. Without this whitelist, every
+       git command in the sandbox trips git's ``safe.directory``
+       check. ``*`` is appropriate here: the sandbox is single-user,
+       every mounted path belongs to the host user who launched it,
+       and the cross-user attack scenario the check exists to
+       prevent doesn't apply.
+
+    2. ``[user]`` block -- the host's user.name / user.email when
+       resolved. Forwarding only this section keeps host-specific
+       knobs (credential helpers, ``commit.gpgsign``,
+       ``core.autocrlf``) out of the container, where they would
+       conflict with the agentbox credential helper or fail outright.
+    """
+    lines = ["[safe]\n", "\tdirectory = *\n"]
+    if identity:
+        lines.append("[user]\n")
+        if "user.name" in identity:
+            lines.append(f"\tname = {identity['user.name']}\n")
+        if "user.email" in identity:
+            lines.append(f"\temail = {identity['user.email']}\n")
+    path.write_text("".join(lines), encoding="utf-8")
+
+
 def _ensure_claude_workspace_trusted(
     claude_json: Path, container_cwd: str,
 ) -> None:
@@ -1306,6 +1361,14 @@ def _run_agent(
     if mode == "pi":
         cmd += ["-v", f"{pi_dir.as_posix()}:/home/agentbox/.pi"]
 
+    git_identity = _resolve_git_identity()
+    git_config_path = workdir / "gitconfig"
+    _write_git_config(git_config_path, git_identity)
+    cmd += [
+        "-v",
+        f"{git_config_path.as_posix()}:/home/agentbox/.gitconfig:ro",
+    ]
+
     if network_mode == "permissive":
         # HTTPS_PROXY-aware tools (gh, git, curl, npm, requests, the
         # Anthropic SDK, ...) all route through the host-subprocess
@@ -1377,6 +1440,13 @@ def _run_agent(
     ) if c]
     if credentials:
         _step("credentials", ", ".join(credentials))
+    if git_identity:
+        parts: list[str] = []
+        if "user.name" in git_identity:
+            parts.append(git_identity["user.name"])
+        if "user.email" in git_identity:
+            parts.append(f"<{git_identity['user.email']}>")
+        _step("git", " ".join(parts))
     launch_cmd = shlex.join([cfg["entrypoint"], *cfg["default_args"], *mode_args])
     _console.print()
     _console.print(f"[bold cyan]$[/] {launch_cmd}")
