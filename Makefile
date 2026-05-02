@@ -7,15 +7,13 @@
 PYTHON ?= python
 
 .DEFAULT_GOAL := help
-.PHONY: help test test-fast lint format typecheck build clean
+.PHONY: help test test-fast check build clean
 
 help:
 	@echo "agentbox dev targets:"
 	@echo "  test        Full test suite (unit + Docker-backed e2e)"
 	@echo "  test-fast   Skip e2e -- inner-loop iteration"
-	@echo "  lint        ruff check src/ tests/"
-	@echo "  format      ruff format src/ tests/ (in place)"
-	@echo "  typecheck   pyright"
+	@echo "  check       ruff check + pyright (always run together)"
 	@echo "  build       Build wheel + sdist via uv (-> dist/)"
 	@echo "  clean       Remove build artifacts and pyc caches"
 
@@ -25,13 +23,8 @@ test:
 test-fast:
 	AGENTBOX_E2E_SKIP=1 $(PYTHON) -m unittest discover tests
 
-lint:
+check:
 	$(PYTHON) -m ruff check src tests
-
-format:
-	$(PYTHON) -m ruff format src tests
-
-typecheck:
 	$(PYTHON) -m pyright
 
 build:
