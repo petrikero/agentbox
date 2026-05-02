@@ -62,16 +62,17 @@ DEFAULT_NETWORK_MODE = "permissive"
 
 # GitHub access modes accepted by --github-mode and the `github.mode`
 # config key. `auto` (default) resolves to one of the other three based
-# on token presence and `github.repos:` content:
+# on token presence:
 #
-#   - no token             -> none           (public reads only)
-#   - token, repos empty   -> unrestricted   (full PAT capability)
+#   - no token             -> public         (anonymous public reads only)
+#   - token, repos empty   -> scoped         (read everywhere, write nowhere)
 #   - token, repos non-empty -> scoped       (writes fenced to listed repos)
 #
-# Explicit `mode:` always wins. `mode: scoped` with empty `repos:` is
-# valid -- reads-everywhere, writes-nowhere.
+# `unrestricted` is the explicit "trust the PAT, no per-repo fence"
+# opt-out and is never picked by auto. `mode: scoped` with empty
+# `repos:` is valid -- reads-everywhere, writes-nowhere.
 GITHUB_MODES: tuple[str, ...] = (
-    "none",
+    "public",
     "unrestricted",
     "scoped",
     "auto",

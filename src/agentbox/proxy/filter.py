@@ -37,7 +37,7 @@ The addon is configured by three file paths passed as mitmproxy options:
                   "branches":      {"push": ["*"], "create": ["*"], "delete": ["*"]}},
                  ...]}
 
-  ``mode`` is one of ``none`` / ``unrestricted`` / ``scoped`` (the
+  ``mode`` is one of ``public`` / ``unrestricted`` / ``scoped`` (the
   ``auto`` value used in the launcher CLI is always resolved before
   reaching the proxy). The per-repo lists are read into
   ``self.repo_policies`` for chunk-3 enforcement; today only
@@ -169,9 +169,9 @@ class AgentboxFilter:
         self.github_config: dict = _load_bundled_github_policy()
         self.allowed_repo_ids: frozenset[str] = frozenset()
         self.allowed_repo_full_names: frozenset[str] = frozenset()
-        # Resolved GitHub access mode (``none`` / ``unrestricted`` /
+        # Resolved GitHub access mode (``public`` / ``unrestricted`` /
         # ``scoped``). Read from agentbox_github_policy and used to
-        # decide whether the GraphQL gate runs (chunk 3).
+        # decide whether the writes-only fence fires.
         self.github_mode: str = "unrestricted"
         # Per-repo policy keyed by full_name -- carries
         # ``{issues, pull_requests, branches}`` lists. Populated by
@@ -324,12 +324,12 @@ class AgentboxFilter:
 
     def _is_graphql(self, request: http.Request) -> bool:
         if self.github_mode != "scoped":
-            # Gate runs only in scoped mode -- ``none`` has no token to
-            # write with anyway, ``unrestricted`` is the explicit "no
-            # per-repo fence" choice. The network allowlist's
-            # ``permissive`` flag is independent now: a project can run
-            # permissive networking and still benefit from the GraphQL
-            # scope check.
+            # Gate runs only in scoped mode -- ``public`` has no token
+            # to write with anyway, ``unrestricted`` is the explicit
+            # "no per-repo fence" choice. The network allowlist's
+            # ``permissive`` flag is independent now: a project can
+            # run permissive networking and still benefit from the
+            # GraphQL scope check.
             return False
         if not self.github_config:
             return False
@@ -445,7 +445,7 @@ class AgentboxFilter:
           git-receive-pack``. ``git-upload-pack`` (fetch) is always
           allowed -- reads aren't fenced.
 
-        Bypassed in ``unrestricted`` and ``none`` modes (the user
+        Bypassed in ``unrestricted`` and ``public`` modes (the user
         opted out of fencing or has no token to write with anyway).
         Returns ``True`` if the request was blocked.
         """

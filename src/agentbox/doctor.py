@@ -243,7 +243,7 @@ def _section_github(
     if explicit and explicit != "auto":
         resolved = explicit
     elif not real_token:
-        resolved = "none"
+        resolved = "public"
     else:
         resolved = "scoped"
     rep.ok("resolved mode", resolved)

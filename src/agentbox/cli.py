@@ -105,8 +105,11 @@ def _github_mode_summary(
     annotates the line so the operator can tell the cwd's origin
     drove the scope (vs an explicit ``--repo`` / config entry).
     """
-    if mode == "none":
-        return "none  [dim](public reads only — no token resolved)[/]"
+    if mode == "public":
+        return (
+            "public  [dim](anonymous public reads only — no token "
+            "resolved)[/]"
+        )
     if mode == "unrestricted":
         suffix = f" → {gh_user}" if gh_user else ""
         return (
@@ -440,11 +443,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         metavar="MODE",
         help=(
             "GitHub access mode. auto (default) resolves based on token "
-            "presence and `github.repos:` from config: no token -> none "
-            "(public reads only); token + no repos -> unrestricted (full "
-            "PAT capability); token + repos -> scoped (writes fenced to "
-            "listed repos). Explicit values: none, unrestricted, scoped. "
-            "Wins over `github.mode` from the config file."
+            "presence: no token -> public (anonymous public reads only); "
+            "token -> scoped (writes fenced to listed repos, with the "
+            "cwd's GitHub origin auto-detected when no --repo is given). "
+            "Explicit values: public, unrestricted (trust the PAT, no "
+            "per-repo fence), scoped. Wins over `github.mode` from the "
+            "config file."
         ),
     )
     parser.add_argument(
@@ -823,13 +827,13 @@ def _resolve_github_mode(
 ) -> str:
     """Map (explicit mode, token presence) onto a concrete mode.
 
-    Explicit ``none``/``unrestricted``/``scoped`` always wins.
+    Explicit ``public``/``unrestricted``/``scoped`` always wins.
     ``auto`` (or unset) resolves per the table:
 
     +--------------+----------------+
     | token        | resolved mode  |
     +==============+================+
-    | absent       | ``none``       |
+    | absent       | ``public``     |
     | present      | ``scoped``     |
     +--------------+----------------+
 
@@ -846,7 +850,7 @@ def _resolve_github_mode(
     if explicit and explicit != "auto":
         return explicit
     if not real_token:
-        return "none"
+        return "public"
     return "scoped"
 
 
@@ -888,7 +892,7 @@ def _write_github_policy(
     Schema::
 
         {
-          "mode": "<none|unrestricted|scoped>",
+          "mode": "<public|unrestricted|scoped>",
           "repos": [
             {full_name, node_id, issues, pull_requests, branches},
             ...

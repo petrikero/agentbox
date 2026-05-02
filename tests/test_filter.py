@@ -634,12 +634,12 @@ class GithubPolicyConfigureTests(unittest.TestCase):
         self.assertEqual(f.allowed_repo_ids, frozenset())
         self.assertEqual(f.repo_policies, {})
 
-    def test_none_mode_loads(self) -> None:
-        path = self._write_policy({"mode": "none", "repos": []})
+    def test_public_mode_loads(self) -> None:
+        path = self._write_policy({"mode": "public", "repos": []})
         f = AgentboxFilter()
         filter_mod.ctx.options.agentbox_github_policy = str(path)
         f.configure({"agentbox_github_policy"})
-        self.assertEqual(f.github_mode, "none")
+        self.assertEqual(f.github_mode, "public")
 
 
 class GithubWriteGateTests(unittest.TestCase):
@@ -808,12 +808,12 @@ class GithubWriteGateTests(unittest.TestCase):
         resp = getattr(flow, "response", None)
         self.assertTrue(resp is None or resp.status_code != 403)
 
-    def test_none_mode_lets_writes_through_for_proxy_layer(self) -> None:
-        # In none mode the surrogate isn't even generated, so writes
+    def test_public_mode_lets_writes_through_for_proxy_layer(self) -> None:
+        # In public mode the surrogate isn't even generated, so writes
         # would fail upstream with 401 anyway. We don't add a
         # belt-and-suspenders 403 at the proxy layer.
         f = self._scoped_filter()
-        f.github_mode = "none"
+        f.github_mode = "public"
         flow = self._flow(
             "POST",
             "https://api.github.com/repos/anyone/anything/issues",
