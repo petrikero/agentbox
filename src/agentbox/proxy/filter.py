@@ -60,6 +60,7 @@ coverage for.
 from __future__ import annotations
 
 import json
+import re
 from fnmatch import fnmatch
 from pathlib import Path
 from collections.abc import Iterator
@@ -79,6 +80,62 @@ from agentbox.proxy.mock_llm import MockLLM
 
 _GRAPHQL_HOST = "api.github.com"
 _GRAPHQL_PATH = "/graphql"
+
+# REST writes against the repo subtree:
+# /repos/{owner}/{name}            -- repo settings
+# /repos/{owner}/{name}/issues     -- create / list issues
+# /repos/{owner}/{name}/pulls/.../comments
+# ...and many more. Any non-GET method against the subtree is a
+# write candidate that the scope check needs to consider. We use a
+# simple regex on the path because the repo segment is always at a
+# fixed depth.
+_REST_REPO_PATH_RE = re.compile(r"^/repos/([^/]+)/([^/]+)(?:/.*)?$")
+
+# git smart-HTTP push:
+# https://github.com/{owner}/{name}(.git)?/git-receive-pack
+# ``.git`` is canonical but GitHub also serves the slash form, so
+# we accept both. ``git-upload-pack`` (fetch) is intentionally not
+# matched -- reads aren't fenced.
+_GIT_PUSH_PATH_RE = re.compile(
+    r"^/([^/]+)/([^/]+?)(?:\.git)?/git-receive-pack/?$"
+)
+
+
+def _repo_from_rest_path(
+    host: str, method: str, path: str,
+) -> str | None:
+    """Return ``owner/name`` if this is a REST write to the repo subtree.
+
+    Returns ``None`` if the host isn't api.github.com, the method is
+    GET (reads are always allowed), or the path isn't under
+    ``/repos/{owner}/{name}/``.
+    """
+    if host != _GRAPHQL_HOST:
+        return None
+    if method == "GET":
+        return None
+    m = _REST_REPO_PATH_RE.match(path)
+    if not m:
+        return None
+    return f"{m.group(1)}/{m.group(2)}"
+
+
+def _repo_from_git_push_path(
+    host: str, method: str, path: str,
+) -> str | None:
+    """Return ``owner/name`` if this is a smart-HTTP push to GitHub.
+
+    Returns ``None`` for the fetch counterpart (``git-upload-pack``),
+    for non-github.com hosts, or for non-POST methods.
+    """
+    if host != "github.com":
+        return None
+    if method != "POST":
+        return None
+    m = _GIT_PUSH_PATH_RE.match(path)
+    if not m:
+        return None
+    return f"{m.group(1)}/{m.group(2)}"
 
 
 _BUNDLED_GITHUB_POLICY = Path(__file__).parent / "github_policy.yaml"
@@ -250,6 +307,12 @@ class AgentboxFilter:
             if blocked:
                 return
 
+        # GitHub writes-only fence. Independent of the GraphQL gate
+        # (which only fires on /graphql) so REST writes and git
+        # smart-HTTP pushes get the same scope check.
+        if self._apply_github_write_gate(flow):
+            return
+
         host = flow.request.pretty_host.lower()
         for handler in self.handlers:
             if handler.matches_host(host):
@@ -260,11 +323,13 @@ class AgentboxFilter:
     # ------------------------------------------------------------------
 
     def _is_graphql(self, request: http.Request) -> bool:
-        if self.permissive:
-            # Permissive mode bypasses the GraphQL gate too -- the
-            # gate is part of the scoping policy that's been switched
-            # off; credential swap on /graphql still runs because the
-            # handler dispatch is independent of this check.
+        if self.github_mode != "scoped":
+            # Gate runs only in scoped mode -- ``none`` has no token to
+            # write with anyway, ``unrestricted`` is the explicit "no
+            # per-repo fence" choice. The network allowlist's
+            # ``permissive`` flag is independent now: a project can run
+            # permissive networking and still benefit from the GraphQL
+            # scope check.
             return False
         if not self.github_config:
             return False
@@ -361,6 +426,71 @@ class AgentboxFilter:
         # Single JSON-formatted log line per request -- operators can
         # `grep 'agentbox graphql:' | jq` to slice/dice.
         ctx.log.info("agentbox graphql: " + json.dumps(fields))
+
+    # ------------------------------------------------------------------
+    # GitHub write fence (REST + git smart-HTTP)
+    # ------------------------------------------------------------------
+
+    def _apply_github_write_gate(self, flow: http.HTTPFlow) -> bool:
+        """Block writes to repos outside the scoped allow-set.
+
+        Two surfaces, same fence:
+
+        - **REST**: ``api.github.com/repos/{owner}/{name}/...`` with
+          any non-GET method. The host's PAT can address every repo
+          it has access to via REST; the scope check confines
+          writes to the listed repos. (GraphQL writes are caught by
+          the dedicated /graphql gate above.)
+        - **git smart-HTTP push**: ``github.com/{owner}/{name}.git/
+          git-receive-pack``. ``git-upload-pack`` (fetch) is always
+          allowed -- reads aren't fenced.
+
+        Bypassed in ``unrestricted`` and ``none`` modes (the user
+        opted out of fencing or has no token to write with anyway).
+        Returns ``True`` if the request was blocked.
+        """
+        if self.github_mode != "scoped":
+            return False
+
+        request = flow.request
+        host = request.pretty_host.lower()
+        path = request.path.split("?", 1)[0]
+        method = request.method.upper()
+
+        owner_name = _repo_from_rest_path(host, method, path)
+        if owner_name is None:
+            owner_name = _repo_from_git_push_path(host, method, path)
+        if owner_name is None:
+            return False
+
+        if owner_name in self.allowed_repo_full_names:
+            return False
+
+        ctx.log.warn(
+            "agentbox github write: " + json.dumps({
+                "event": "github_write",
+                "verdict": "blocked",
+                "scope": "out_of_scope",
+                "method": method,
+                "host": host,
+                "path": path,
+                "target": owner_name,
+            })
+        )
+        body = json.dumps({
+            "error": "scope_out_of_scope",
+            "message": (
+                "agentbox: write to " + owner_name + " denied -- "
+                "not in the scoped repos set. Pass --repo "
+                "OWNER/NAME to the launcher (or add it under "
+                "github.repos: in agentbox.config.yaml) to allow."
+            ),
+            "detail": owner_name,
+        }).encode("utf-8")
+        flow.response = http.Response.make(
+            403, body, {"Content-Type": "application/json"},
+        )
+        return True
 
     # ------------------------------------------------------------------
     # Network allowlist (existing)

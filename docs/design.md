@@ -367,7 +367,15 @@ github:
         create: ["agent/*"]
 ```
 
-`mode: auto` resolves to `none` when no token is available and `scoped` when a token is present. In auto mode, if no explicit repos are listed (neither `--repo` nor `github.repos:` in the config), the launcher detects the cwd's GitHub origin via `git remote get-url origin` and pre-fills it as the single allowed repo. The result is the natural default: **read/write the current repo, read-only on every other repo the PAT can see** (the writes-only fence is enforced once chunk-3 enforcement lands). When the cwd has no recognised GitHub origin, scoped mode runs with empty repos — read everywhere, write nowhere.
+`mode: auto` resolves to `none` when no token is available and `scoped` when a token is present. In auto mode, if no explicit repos are listed (neither `--repo` nor `github.repos:` in the config), the launcher detects the cwd's GitHub origin via `git remote get-url origin` and pre-fills it as the single allowed repo. The result is the natural default: **read/write the current repo, read-only on every other repo the PAT can see**. When the cwd has no recognised GitHub origin, scoped mode runs with empty repos — read everywhere, write nowhere.
+
+In `scoped` mode the proxy enforces a writes-only fence across three surfaces independent of the network allowlist's `permissive` flag:
+
+- **GraphQL** (`POST api.github.com/graphql`): the existing operation allowlist + per-repo node-ID scope check return `unsupported_feature` / `scope_out_of_scope` 403s.
+- **REST** (`api.github.com/repos/{owner}/{name}/...` non-GET): writes to repos outside the listed set return `scope_out_of_scope`. Reads (any GET) and requests outside the `/repos/` subtree (`/user/...`, `/search/...`, `/rate_limit`, ...) pass through unchecked — the host's PAT is the outer fence on what the proxy forwards.
+- **git smart-HTTP push** (`github.com/{owner}/{name}.git/git-receive-pack`): pushes to repos outside the listed set return 403. Fetch (`git-upload-pack`) is always allowed.
+
+`unrestricted` mode bypasses all three (the explicit "no fence" choice), and `none` mode has no surrogate to write with so the upstream returns 401 without proxy involvement.
 
 Explicit `mode:` always wins. Pass `--github-mode unrestricted` (or set it in the config) for the old "trust the PAT, no per-repo fence" behaviour. The launcher resolves the merged config (CLI flags additive over yaml) into `workdir/github.json` (`{mode, repos: [{full_name, node_id, issues, pull_requests, branches}]}`) and hands that to the proxy via `--github-policy`. The curated GraphQL operation allowlist lives in a separate bundled file (`proxy/github_policy.yaml`), loaded by the proxy regardless of the network mode.
 

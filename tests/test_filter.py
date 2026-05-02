@@ -186,15 +186,32 @@ class PermissiveModeTests(unittest.TestCase):
             _make_request("DELETE", "https://evil.example.com/wipe")
         ))
 
-    def test_graphql_gate_bypassed_when_permissive(self) -> None:
-        # github_config is populated (so strict mode would gate this
-        # request), but permissive must short-circuit _is_graphql.
+    def test_graphql_gate_bypassed_when_github_mode_unrestricted(self) -> None:
+        # github_config is populated (so the gate would otherwise
+        # fire), but unrestricted mode is the explicit "no per-repo
+        # fence" choice -- _is_graphql must short-circuit. Network
+        # permissiveness is independent: we set permissive=True
+        # here only to mirror the historical scenario this test
+        # used to cover; the github_mode is what drives the gate.
         f = _make_filter(permissive=True)
+        f.github_mode = "unrestricted"
         f.github_config = {"graphql_operations": {"queries": ["viewer"]}}
         req = _make_request(
             "POST", "https://api.github.com/graphql", body=b'{"query":"..."}'
         )
         self.assertFalse(f._is_graphql(req))
+
+    def test_graphql_gate_runs_on_permissive_network_when_scoped(self) -> None:
+        # The whole point of decoupling: a project can keep its
+        # network permissive and still get the GraphQL scope check
+        # because github_mode == scoped is what drives the gate.
+        f = _make_filter(permissive=True)
+        f.github_mode = "scoped"
+        f.github_config = {"graphql_operations": {"queries": ["viewer"]}}
+        req = _make_request(
+            "POST", "https://api.github.com/graphql", body=b'{"query":"..."}'
+        )
+        self.assertTrue(f._is_graphql(req))
 
     def test_credential_handler_still_runs_when_permissive(self) -> None:
         # The whole point of permissive mode: surrogate -> real swap
@@ -387,6 +404,7 @@ class GraphqlGateTests(unittest.TestCase):
 
     def _gated(self) -> AgentboxFilter:
         f = _make_filter(domains=["api.github.com"])
+        f.github_mode = "scoped"
         f.github_config = {
             "graphql_operations": {
                 "queries": ["viewer", "repository"],
@@ -455,12 +473,15 @@ class GraphqlGateTests(unittest.TestCase):
         self.assertEqual(payload["detail"], "I_kwDOO5rJ/84AAYaf")
 
     def test_non_graphql_request_bypasses_gate(self) -> None:
-        # A REST POST to api.github.com isn't /graphql -> gate skipped.
+        # A REST POST to api.github.com isn't /graphql -> the GraphQL
+        # gate is skipped. Use /user (outside /repos/...) so the
+        # separate REST write fence doesn't fire either; this test
+        # is specifically about the graphql gate boundary.
         f = self._gated()
         flow = _fake_flow(_make_request(
-            "POST", "https://api.github.com/repos/x/y/issues",
+            "POST", "https://api.github.com/user/keys",
             headers={"Content-Type": "application/json"},
-            body=b'{"title":"hi"}',
+            body=b'{"title":"k"}',
         ))
         f.request(flow)
         self.assertFalse(
@@ -619,6 +640,188 @@ class GithubPolicyConfigureTests(unittest.TestCase):
         filter_mod.ctx.options.agentbox_github_policy = str(path)
         f.configure({"agentbox_github_policy"})
         self.assertEqual(f.github_mode, "none")
+
+
+class GithubWriteGateTests(unittest.TestCase):
+    """Coverage for the REST + git-push writes-only fence.
+
+    The fence runs in the request() pipeline after the network
+    allowlist and the GraphQL gate; it fires only in scoped mode.
+    Tests cover:
+    - REST write to a listed repo passes through.
+    - REST write to an unlisted repo returns 403 scope_out_of_scope.
+    - REST GET against any repo passes through (reads aren't fenced).
+    - git-push to a listed repo passes through.
+    - git-push to an unlisted repo returns 403.
+    - git-fetch (upload-pack) is always allowed even on unlisted
+      repos.
+    - unrestricted mode bypasses the fence entirely.
+    """
+
+    def setUp(self) -> None:
+        self.warn_log: list[str] = []
+        log = SimpleNamespace(
+            warn=lambda msg, *a, **k: self.warn_log.append(msg),
+            info=lambda *a, **k: None,
+        )
+        self._patch = patch.object(
+            filter_mod, "ctx", SimpleNamespace(log=log),
+        )
+        self._patch.start()
+
+    def tearDown(self) -> None:
+        self._patch.stop()
+
+    def _scoped_filter(self) -> AgentboxFilter:
+        f = _make_filter(domains=["api.github.com", "github.com"])
+        f.github_mode = "scoped"
+        f.allowed_repo_full_names = frozenset({"my-org/allowed"})
+        return f
+
+    def _flow(
+        self, method: str, url: str, body: bytes = b"",
+    ) -> "HTTPFlow":
+        return _fake_flow(_make_request(method, url, body=body))
+
+    # REST write gate ---------------------------------------------------
+
+    def test_rest_post_to_listed_repo_passes(self) -> None:
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST",
+            "https://api.github.com/repos/my-org/allowed/issues",
+            body=b'{"title":"hi"}',
+        )
+        f.request(flow)
+        # Either no response (passed through) or non-403.
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    def test_rest_post_to_unlisted_repo_blocked(self) -> None:
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST",
+            "https://api.github.com/repos/other/exfil/issues",
+            body=b'{"title":"leak"}',
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+        payload = json.loads(flow.response.content)
+        self.assertEqual(payload["error"], "scope_out_of_scope")
+        self.assertEqual(payload["detail"], "other/exfil")
+
+    def test_rest_patch_to_unlisted_repo_blocked(self) -> None:
+        f = self._scoped_filter()
+        flow = self._flow(
+            "PATCH",
+            "https://api.github.com/repos/other/exfil/issues/1",
+            body=b'{"state":"closed"}',
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+
+    def test_rest_get_on_unlisted_repo_passes(self) -> None:
+        # Reads aren't fenced -- the host PAT is the outer fence on
+        # what the proxy forwards, but we don't add a second layer
+        # for reads.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "GET",
+            "https://api.github.com/repos/other/anything/issues",
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    def test_rest_post_outside_repos_subtree_passes(self) -> None:
+        # /user/keys, /search/code, /rate_limit etc. don't target a
+        # specific repo so the fence doesn't apply. The host
+        # allowlist still gates these.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST", "https://api.github.com/user/keys",
+            body=b'{"title":"k"}',
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    # git smart-HTTP push gate ------------------------------------------
+
+    def test_git_push_to_listed_repo_passes(self) -> None:
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST",
+            "https://github.com/my-org/allowed.git/git-receive-pack",
+            body=b"\x00\x00pack data",
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    def test_git_push_to_unlisted_repo_blocked(self) -> None:
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST",
+            "https://github.com/other/exfil.git/git-receive-pack",
+            body=b"\x00\x00pack data",
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+        payload = json.loads(flow.response.content)
+        self.assertEqual(payload["detail"], "other/exfil")
+
+    def test_git_fetch_on_unlisted_repo_passes(self) -> None:
+        # upload-pack is fetch -- always allowed.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST",
+            "https://github.com/other/anything.git/git-upload-pack",
+            body=b"\x00\x00want data",
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    def test_git_push_path_without_dot_git_suffix_blocked(self) -> None:
+        # GitHub serves both forms; the gate must catch both.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST",
+            "https://github.com/other/exfil/git-receive-pack",
+            body=b"\x00\x00",
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+
+    # Mode bypass -------------------------------------------------------
+
+    def test_unrestricted_mode_lets_writes_through(self) -> None:
+        f = self._scoped_filter()
+        f.github_mode = "unrestricted"
+        flow = self._flow(
+            "POST",
+            "https://api.github.com/repos/anyone/anything/issues",
+            body=b'{}',
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    def test_none_mode_lets_writes_through_for_proxy_layer(self) -> None:
+        # In none mode the surrogate isn't even generated, so writes
+        # would fail upstream with 401 anyway. We don't add a
+        # belt-and-suspenders 403 at the proxy layer.
+        f = self._scoped_filter()
+        f.github_mode = "none"
+        flow = self._flow(
+            "POST",
+            "https://api.github.com/repos/anyone/anything/issues",
+            body=b'{}',
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
 
 
 if __name__ == "__main__":
