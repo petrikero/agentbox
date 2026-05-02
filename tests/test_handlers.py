@@ -222,5 +222,112 @@ class GithubHandlerTests(unittest.TestCase):
         self.assertEqual(req.headers["X-Custom-Token"], "Bearer ghp_FAKE")
 
 
+class AlternateCredentialScrubTests(unittest.TestCase):
+    """Defense-in-depth: drop alternate credential carriers on scoped hosts.
+
+    GitHub historically accepts credentials on Cookie (web session),
+    X-GitHub-Token (legacy header), and the deprecated-but-still-
+    recognised ?access_token= query param. agentbox never uses any of
+    these legitimately, so the handler strips them on every scoped-
+    host request to close those alternate channels for an in-container
+    attacker / prompt-injected agent.
+    """
+
+    def setUp(self) -> None:
+        self.warn_log: list[str] = []
+        log = SimpleNamespace(
+            warn=lambda msg, *a, **k: self.warn_log.append(msg),
+        )
+        self._patch = patch.object(
+            handlers_mod, "ctx", SimpleNamespace(log=log),
+        )
+        self._patch.start()
+
+    def tearDown(self) -> None:
+        self._patch.stop()
+
+    def _handler(self) -> GithubCredentialHandler:
+        return GithubCredentialHandler(
+            surrogate="ghp_FAKE", real="ghp_REAL",
+        )
+
+    def test_cookie_header_dropped_on_scoped_host(self) -> None:
+        h = self._handler()
+        req = _make_request(
+            "GET", "https://api.github.com/repos/x/y",
+            headers={
+                "Authorization": "Bearer ghp_FAKE",
+                "Cookie": "user_session=stolen-cookie",
+            },
+        )
+        h.handle(req)
+        self.assertEqual(req.headers["Authorization"], "Bearer ghp_REAL")
+        self.assertNotIn("Cookie", req.headers)
+
+    def test_x_github_token_header_dropped(self) -> None:
+        h = self._handler()
+        req = _make_request(
+            "GET", "https://api.github.com/repos/x/y",
+            headers={
+                "Authorization": "Bearer ghp_FAKE",
+                "X-GitHub-Token": "ghp_ATTACKER",
+            },
+        )
+        h.handle(req)
+        self.assertNotIn("X-GitHub-Token", req.headers)
+
+    def test_access_token_query_param_dropped(self) -> None:
+        h = self._handler()
+        req = _make_request(
+            "GET",
+            "https://api.github.com/repos/x/y?access_token=ghp_ATTACKER",
+            headers={"Authorization": "Bearer ghp_FAKE"},
+        )
+        h.handle(req)
+        self.assertNotIn("access_token", req.query)
+
+    def test_other_query_params_preserved(self) -> None:
+        # Only the credential-bearing param is removed.
+        h = self._handler()
+        req = _make_request(
+            "GET",
+            "https://api.github.com/search/code"
+            "?q=secret&access_token=ghp_ATTACKER&per_page=10",
+            headers={"Authorization": "Bearer ghp_FAKE"},
+        )
+        h.handle(req)
+        self.assertNotIn("access_token", req.query)
+        self.assertEqual(req.query["q"], "secret")
+        self.assertEqual(req.query["per_page"], "10")
+
+    def test_scrubbing_disabled_when_allow_foreign(self) -> None:
+        # ``allow_foreign=True`` is the explicit "trust whatever the
+        # client sent" escape hatch; alternate carriers are kept too
+        # for symmetry with Authorization.
+        h = GithubCredentialHandler(
+            surrogate="ghp_FAKE", real="ghp_REAL", allow_foreign=True,
+        )
+        req = _make_request(
+            "GET", "https://api.github.com/x",
+            headers={"Cookie": "user_session=keep-me"},
+        )
+        h.handle(req)
+        self.assertEqual(req.headers["Cookie"], "user_session=keep-me")
+
+    def test_carriers_with_different_casing_dropped(self) -> None:
+        h = self._handler()
+        req = _make_request(
+            "GET", "https://api.github.com/x",
+            headers={
+                "Authorization": "Bearer ghp_FAKE",
+                "COOKIE": "stolen",
+                "x-github-token": "ghp_ATTACKER",
+            },
+        )
+        h.handle(req)
+        self.assertNotIn("COOKIE", req.headers)
+        self.assertNotIn("x-github-token", req.headers)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -38,6 +38,14 @@ class GithubCredentialHandler:
     scoped host that doesn't carry the surrogate is dropped, so an
     in-container attacker can't smuggle their own PAT through.
     Override only by passing ``allow_foreign=True``.
+
+    Defense-in-depth credential scrubbing: GitHub historically
+    accepted credentials on alternate channels too -- ``Cookie``
+    (web-session auth), ``X-GitHub-Token`` (legacy header), and
+    the deprecated-but-still-recognised ``?access_token=...``
+    query parameter. agentbox never legitimately uses any of
+    these, so we strip them on every scoped-host request to
+    close those alternate channels.
     """
 
     SCOPES: tuple[str, ...] = (
@@ -48,6 +56,24 @@ class GithubCredentialHandler:
         "*.pkg.github.com",
     )
     HEADER_LOWER: str = "authorization"
+
+    # Headers we always strip on a scoped-host request. None of
+    # these are auth carriers we use; presence is either an
+    # in-container leak attempt or a holdover from some earlier
+    # tool's environment. Compared case-insensitively against the
+    # request header names.
+    _SCRUB_HEADERS_LOWER: tuple[str, ...] = (
+        "cookie",
+        "x-github-token",
+    )
+    # Query parameters that GitHub accepts as alternate credential
+    # carriers. We always remove these on scoped hosts so an
+    # attacker-supplied URL like
+    # ``api.github.com/...?access_token=ghp_real`` can't smuggle
+    # a foreign PAT through.
+    _SCRUB_QUERY_PARAMS: tuple[str, ...] = (
+        "access_token",
+    )
 
     def __init__(
         self,
@@ -82,6 +108,41 @@ class GithubCredentialHandler:
                     f"'{name}' on {host}"
                 )
                 del request.headers[name]
+        if not self.allow_foreign:
+            self._scrub_alternate_carriers(request, host)
+
+    def _scrub_alternate_carriers(
+        self, request: http.Request, host: str,
+    ) -> None:
+        """Remove non-Authorization credential channels.
+
+        Cookie / X-GitHub-Token / ?access_token= are alternate
+        auth carriers GitHub recognises. We never use them
+        legitimately, so an in-container request that carries
+        any of them is either a smuggled credential or noise
+        from an earlier tool. Either way, drop on scoped hosts.
+        """
+        for name in list(request.headers.keys()):
+            if name.lower() in self._SCRUB_HEADERS_LOWER:
+                ctx.log.warn(
+                    f"agentbox: dropped alternate credential header "
+                    f"'{name}' on {host}"
+                )
+                del request.headers[name]
+        # mitmproxy exposes query parameters via request.query
+        # (a MultiDictView). Iterate over a list copy because
+        # deletion mutates the underlying store.
+        try:
+            query_keys = list(request.query.keys())
+        except AttributeError:
+            return
+        for key in query_keys:
+            if key.lower() in self._SCRUB_QUERY_PARAMS:
+                ctx.log.warn(
+                    f"agentbox: dropped query credential carrier "
+                    f"'?{key}=...' on {host}"
+                )
+                del request.query[key]
 
 
 def _try_swap(value: str, surrogate: str, real: str) -> str | None:

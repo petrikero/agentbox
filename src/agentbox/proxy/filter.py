@@ -135,11 +135,12 @@ def _classify_github_write(
       allowed-repo set. ``reason`` tags the surface for log
       lines (``rest``/``uploads``/``git_push``).
     - ``("denied", target, reason)`` -- categorically denied in
-      scoped mode regardless of allowed_repos. Gist writes
-      (`reason="gist_write"`) and new-repo creation
-      (`reason="new_repo_creation"`) fall here -- neither maps
-      onto the per-repo scope model, and both are clean
-      exfiltration channels.
+      scoped mode regardless of allowed_repos. ``reason`` is one
+      of ``gist_write``, ``new_repo_creation``,
+      ``user_account_write``, ``org_admin_write``, or
+      ``package_write``. None of these map onto the per-repo
+      scope model, and each is a documented exfil/persistence
+      channel.
     - ``None`` -- not a write surface; pass through unchecked
       (host outside the gate's surface, read method, or path
       that isn't a GitHub write endpoint we recognise).
@@ -152,12 +153,26 @@ def _classify_github_write(
         return None
 
     if host == _GRAPHQL_HOST:
-        # New-repo creation -- own account.
+        # New-repo creation -- own account or in an org. Matched
+        # before the broader ``/user/*`` and ``/orgs/*`` rules so
+        # the 403 reason is the more specific
+        # ``new_repo_creation`` rather than the catch-all.
         if method == "POST" and path == "/user/repos":
             return ("denied", "/user/repos", "new_repo_creation")
-        # New-repo creation -- in an org.
         if method == "POST" and _ORG_REPOS_PATH_RE.match(path):
             return ("denied", path, "new_repo_creation")
+        # Authenticated user's own account writes: SSH keys, GPG
+        # keys, emails, profile (PATCH /user → bio/blog leak).
+        # Categorically denied -- none of these are tied to a
+        # listed repo, and several are persistence/exfil
+        # channels (a /user/keys add survives the session).
+        if path == "/user" or path.startswith("/user/"):
+            return ("denied", path, "user_account_write")
+        # Org-level admin writes (teams, memberships, hooks, ...)
+        # not covered by the new-repo case above. Same logic:
+        # not per-repo, frequently persistence-shaped.
+        if path.startswith("/orgs/"):
+            return ("denied", path, "org_admin_write")
         # Gist writes via the API. Gists aren't per-repo; no scope
         # check would meaningfully fence them, and a public gist
         # is the cleanest exfil channel imaginable.
@@ -194,6 +209,16 @@ def _classify_github_write(
         # gist.github.com serves git push to gists. Same exfil
         # logic as the API gist writes -- categorically denied.
         return ("denied", path, "gist_write")
+
+    if host.endswith(".pkg.github.com"):
+        # GitHub Packages registries (npm/maven/docker/nuget/...)
+        # share the ``*.github.com`` credential-swap scope, so the
+        # real PAT IS forwarded here. Path shape varies per
+        # package type and most don't carry an obvious owner/repo
+        # segment; blanket-deny in scoped mode is the safe
+        # default. Operators wanting to publish packages can
+        # switch to unrestricted (or run a separate session).
+        return ("denied", path, "package_write")
 
     return None
 
@@ -584,6 +609,30 @@ class AgentboxFilter:
                 "mode (a fresh repo would bypass the per-repo "
                 "fence). Pass --github-mode unrestricted if you "
                 "really need to create repos."
+            )
+        if reason == "user_account_write":
+            return (
+                "agentbox: writes to the authenticated user's "
+                "account are denied in scoped mode (e.g. adding "
+                "SSH keys would establish persistent access; "
+                "PATCH /user can leak through public profile "
+                "fields). Pass --github-mode unrestricted to "
+                "permit user-account writes."
+            )
+        if reason == "org_admin_write":
+            return (
+                "agentbox: org-level admin writes are denied in "
+                "scoped mode -- teams / memberships / hooks are "
+                "persistence-shaped and not tied to the per-repo "
+                "fence. Pass --github-mode unrestricted to "
+                "permit org admin writes."
+            )
+        if reason == "package_write":
+            return (
+                "agentbox: writes to *.pkg.github.com are denied "
+                "in scoped mode (package publishing isn't tied "
+                "to the per-repo fence). Pass --github-mode "
+                "unrestricted to permit package writes."
             )
         return (
             "agentbox: write to " + target + " denied -- not in the "

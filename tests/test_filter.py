@@ -474,14 +474,15 @@ class GraphqlGateTests(unittest.TestCase):
 
     def test_non_graphql_request_bypasses_gate(self) -> None:
         # A REST POST to api.github.com isn't /graphql -> the GraphQL
-        # gate is skipped. Use /user (outside /repos/...) so the
-        # separate REST write fence doesn't fire either; this test
-        # is specifically about the graphql gate boundary.
+        # gate is skipped. Use /markdown (a no-op markdown renderer
+        # outside any fenced subtree) so neither the GraphQL gate
+        # nor the REST write fence fire; this test is specifically
+        # about the graphql gate boundary.
         f = self._gated()
         flow = _fake_flow(_make_request(
-            "POST", "https://api.github.com/user/keys",
+            "POST", "https://api.github.com/markdown",
             headers={"Content-Type": "application/json"},
-            body=b'{"title":"k"}',
+            body=b'{"text":"# hi"}',
         ))
         f.request(flow)
         self.assertFalse(
@@ -786,14 +787,15 @@ class GithubWriteGateTests(unittest.TestCase):
         resp = getattr(flow, "response", None)
         self.assertTrue(resp is None or resp.status_code != 403)
 
-    def test_rest_post_outside_repos_subtree_passes(self) -> None:
-        # /user/keys, /search/code, /rate_limit etc. don't target a
-        # specific repo so the fence doesn't apply. The host
+    def test_rest_post_outside_fenced_subtrees_passes(self) -> None:
+        # /markdown, /rate_limit (POST), /search/code etc. don't
+        # target a specific repo and aren't user-account or
+        # org-admin writes; the fence shouldn't apply. The host
         # allowlist still gates these.
         f = self._scoped_filter()
         flow = self._flow(
-            "POST", "https://api.github.com/user/keys",
-            body=b'{"title":"k"}',
+            "POST", "https://api.github.com/markdown",
+            body=b'{"text":"# hello"}',
         )
         f.request(flow)
         resp = getattr(flow, "response", None)
@@ -1010,7 +1012,136 @@ class GithubWriteGateTests(unittest.TestCase):
         resp = getattr(flow, "response", None)
         self.assertTrue(resp is None or resp.status_code != 403)
 
+    # User-account writes -----------------------------------------------
+
+    def test_user_keys_post_blocked(self) -> None:
+        # POST /user/keys adds an SSH key to the authenticated user's
+        # account -- a clean persistent backdoor. Categorically denied.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST", "https://api.github.com/user/keys",
+            body=b'{"title":"backdoor","key":"ssh-rsa AAAA..."}',
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+        payload = json.loads(flow.response.content)
+        self.assertEqual(payload["error"], "scope_user_account_write")
+
+    def test_user_patch_blocked(self) -> None:
+        # PATCH /user lets the agent write to the public profile
+        # (bio, blog) -- a public-leak channel.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "PATCH", "https://api.github.com/user",
+            body=b'{"bio":"https://attacker.example/?secret=..."}',
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+        payload = json.loads(flow.response.content)
+        self.assertEqual(payload["error"], "scope_user_account_write")
+
+    def test_user_emails_post_blocked(self) -> None:
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST", "https://api.github.com/user/emails",
+            body=b'["attacker@example.com"]',
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+
+    def test_user_get_passes(self) -> None:
+        # Reading the user profile is fine.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "GET", "https://api.github.com/user",
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    # Org-admin writes --------------------------------------------------
+
+    def test_org_team_creation_blocked(self) -> None:
+        f = self._scoped_filter()
+        flow = self._flow(
+            "POST", "https://api.github.com/orgs/some-org/teams",
+            body=b'{"name":"backdoor"}',
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+        payload = json.loads(flow.response.content)
+        self.assertEqual(payload["error"], "scope_org_admin_write")
+
+    def test_org_membership_put_blocked(self) -> None:
+        f = self._scoped_filter()
+        flow = self._flow(
+            "PUT",
+            "https://api.github.com/orgs/some-org/memberships/attacker",
+            body=b'{"role":"admin"}',
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+
+    def test_org_get_passes(self) -> None:
+        f = self._scoped_filter()
+        flow = self._flow(
+            "GET", "https://api.github.com/orgs/some-org/teams",
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    # Package registry writes -------------------------------------------
+
+    def test_npm_pkg_publish_blocked(self) -> None:
+        # npm.pkg.github.com/.../@scope/name -- npm publish.
+        f = self._scoped_filter()
+        f.domains = [*f.domains, "*.pkg.github.com"]
+        flow = self._flow(
+            "PUT",
+            "https://npm.pkg.github.com/@my-org/my-package",
+            body=b'{"_attachments":{"my-package-1.0.0.tgz":{...}}}',
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+        payload = json.loads(flow.response.content)
+        self.assertEqual(payload["error"], "scope_package_write")
+
+    def test_docker_pkg_blob_upload_blocked(self) -> None:
+        # docker.pkg.github.com or ghcr-style v2 path.
+        f = self._scoped_filter()
+        f.domains = [*f.domains, "*.pkg.github.com"]
+        flow = self._flow(
+            "POST",
+            "https://docker.pkg.github.com/v2/my-org/img/blobs/uploads/",
+            body=b"binary blob",
+        )
+        f.request(flow)
+        self.assertEqual(flow.response.status_code, 403)
+
+    def test_pkg_registry_get_passes(self) -> None:
+        # Pulls (downloads) are reads -- always allowed.
+        f = self._scoped_filter()
+        f.domains = [*f.domains, "*.pkg.github.com"]
+        flow = self._flow(
+            "GET", "https://npm.pkg.github.com/@my-org/my-package",
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
     # Bypass in non-scoped mode -----------------------------------------
+
+    def test_unrestricted_mode_allows_user_keys_write(self) -> None:
+        f = self._scoped_filter()
+        f.github_mode = "unrestricted"
+        flow = self._flow(
+            "POST", "https://api.github.com/user/keys",
+            body=b'{"title":"k","key":"ssh-rsa AAAA..."}',
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
 
     def test_unrestricted_mode_allows_gist_write(self) -> None:
         f = self._scoped_filter()
