@@ -641,6 +641,26 @@ class GithubPolicyConfigureTests(unittest.TestCase):
         f.configure({"agentbox_github_policy"})
         self.assertEqual(f.github_mode, "public")
 
+    def test_malformed_bare_list_fails_closed(self) -> None:
+        # The launcher always writes ``{mode, repos: [...]}``. If a
+        # legacy or corrupted file ever surfaces a bare list, the
+        # filter must default to ``public`` (no writes) rather than
+        # silently flipping to ``unrestricted`` (writes anywhere
+        # the PAT can reach).
+        path = self._tmp / "github.json"
+        path.write_text(
+            json.dumps([{"full_name": "evil/repo", "node_id": "x"}]),
+            encoding="utf-8",
+        )
+        f = AgentboxFilter()
+        filter_mod.ctx.options.agentbox_github_policy = str(path)
+        f.configure({"agentbox_github_policy"})
+        self.assertEqual(f.github_mode, "public")
+        # And the repos from the malformed payload MUST NOT have
+        # been imported as writable.
+        self.assertEqual(f.allowed_repo_full_names, frozenset())
+        self.assertEqual(f.repo_policies, {})
+
 
 class GithubWriteGateTests(unittest.TestCase):
     """Coverage for the REST + git-push writes-only fence.
@@ -727,6 +747,30 @@ class GithubWriteGateTests(unittest.TestCase):
         f = self._scoped_filter()
         flow = self._flow(
             "GET",
+            "https://api.github.com/repos/other/anything/issues",
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    def test_rest_head_on_unlisted_repo_passes(self) -> None:
+        # HEAD is "GET without the body" in HTTP semantics --
+        # metadata-only, never a write. Must pass the fence even
+        # when the target repo isn't listed.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "HEAD",
+            "https://api.github.com/repos/other/anything/issues/1",
+        )
+        f.request(flow)
+        resp = getattr(flow, "response", None)
+        self.assertTrue(resp is None or resp.status_code != 403)
+
+    def test_rest_options_on_unlisted_repo_passes(self) -> None:
+        # CORS preflight; never a write surface. Must pass.
+        f = self._scoped_filter()
+        flow = self._flow(
+            "OPTIONS",
             "https://api.github.com/repos/other/anything/issues",
         )
         f.request(flow)

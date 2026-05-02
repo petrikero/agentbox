@@ -101,18 +101,21 @@ _GIT_PUSH_PATH_RE = re.compile(
 )
 
 
+_READ_METHODS: frozenset[str] = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
 def _repo_from_rest_path(
     host: str, method: str, path: str,
 ) -> str | None:
     """Return ``owner/name`` if this is a REST write to the repo subtree.
 
     Returns ``None`` if the host isn't api.github.com, the method is
-    GET (reads are always allowed), or the path isn't under
-    ``/repos/{owner}/{name}/``.
+    a read (``GET``, ``HEAD``, or preflight ``OPTIONS``), or the
+    path isn't under ``/repos/{owner}/{name}/``.
     """
     if host != _GRAPHQL_HOST:
         return None
-    if method == "GET":
+    if method in _READ_METHODS:
         return None
     m = _REST_REPO_PATH_RE.match(path)
     if not m:
@@ -250,11 +253,21 @@ class AgentboxFilter:
                         data.get("mode") or "unrestricted"
                     )
                 else:
-                    # Defensive: the launcher always writes a dict.
-                    # If we ever see a bare list (legacy shape), treat
-                    # it as the repos array with mode=unrestricted.
-                    repos = data
-                    self.github_mode = "unrestricted"
+                    # Fail-closed on a malformed policy file. The
+                    # launcher always writes a dict; an unexpected
+                    # shape means something else corrupted the file
+                    # or wrote an obsolete format. Defaulting to
+                    # ``public`` (no surrogate handler runs anyway,
+                    # and the writes-only fence's bypass case still
+                    # wouldn't hand the agent extra power) is safer
+                    # than silently flipping to unrestricted.
+                    ctx.log.warn(
+                        "agentbox: malformed github_policy JSON "
+                        f"(expected mapping, got {type(data).__name__}); "
+                        f"falling back to mode=public"
+                    )
+                    repos = []
+                    self.github_mode = "public"
                 self.allowed_repo_ids = frozenset(
                     str(r["node_id"]) for r in repos if r.get("node_id")
                 )

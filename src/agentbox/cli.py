@@ -263,6 +263,19 @@ def _main(argv: list[str] | None) -> None:
     github_mode = _resolve_github_mode(
         getattr(args, "github_mode", None), real_token,
     )
+    if github_mode == "scoped" and not real_token:
+        # Explicit scoped without a token would arm the fence but the
+        # surrogate handler never registers (no PAT to swap to), so the
+        # agent sees confusing 401s on every github write instead of a
+        # clean policy error. Refuse at startup so the failure mode is
+        # localised here.
+        sys.exit(
+            "agentbox: --github-mode scoped requires a host GitHub "
+            "token (set GH_TOKEN or run `gh auth login`). Pass "
+            "--github-mode public to run anonymously, or "
+            "--github-mode unrestricted with a token if you really "
+            "want no per-repo fence."
+        )
     args.github_mode = github_mode  # so doctor and downstream see resolved value
     _write_github_policy(workdir / "github.json", github_mode, resolved_repos)
     _step(

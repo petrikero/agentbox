@@ -7,3 +7,8 @@ build/
 dist/
 *.log
 .DS_Store
+
+# Worktrees spawned by Claude Code's `Agent` tool with `isolation:
+# worktree`. These are temporary copies of the repo and must not
+# land in commits.
+.claude/worktrees/
